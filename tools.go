@@ -83,13 +83,34 @@ type describeResult struct {
 	NamespaceDescription
 }
 
+// boolPtr is a small helper for *bool fields in ToolAnnotations (the SDK
+// mixes pointer and value-typed bools across fields).
+func boolPtr(b bool) *bool { return &b }
+
+// closedWorld marks every notebook tool as closed-world: notebook only
+// interacts with its own PVC-backed storage, never with external
+// entities. Set once and reused on every tool.
+var closedWorld = boolPtr(false)
+
 // registerTools wires the notebook tools onto the MCP server. Each handler
 // is a thin shim that validates input and delegates to the store.
+//
+// Tool annotations describe behaviour to the client so it can decide
+// whether to auto-execute or prompt: read-only tools (list_namespaces,
+// describe_namespace, get) are safe to run without confirmation; append
+// and delete are destructive (in the change-state sense). delete is
+// idempotent (tombstoning twice is a no-op); append is not (each call
+// adds a new entry).
 func registerTools(server *mcp.Server, store *Store) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "list_namespaces",
 		Description: "List notebook namespaces with summary info (entry count, last-updated timestamp) " +
 			"for each. Tombstoned entries are excluded from the count.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "List namespaces",
+			ReadOnlyHint:  true,
+			OpenWorldHint: closedWorld,
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ listNamespacesArgs) (*mcp.CallToolResult, listNamespacesResult, error) {
 		ns, err := store.ListNamespaces()
 		if err != nil {
@@ -105,6 +126,11 @@ func registerTools(server *mcp.Server, store *Store) {
 			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often " +
 			"it appears). Answers \"what's in here\" in a single pass, without returning the " +
 			"entries themselves.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "Describe namespace",
+			ReadOnlyHint:  true,
+			OpenWorldHint: closedWorld,
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args describeArgs) (*mcp.CallToolResult, describeResult, error) {
 		d, err := store.Describe(args.Namespace, args.Field)
 		if err != nil {
@@ -119,6 +145,14 @@ func registerTools(server *mcp.Server, store *Store) {
 			"number, object, array, null). Returns the stored entry in full so the caller can " +
 			"confirm what landed without a follow-up read. The namespace is created on first append.",
 		InputSchema: appendInputSchema,
+		Annotations: &mcp.ToolAnnotations{
+			Title: "Append entry",
+			// ReadOnlyHint defaults to false. Destructive=false because
+			// append only adds; it never overwrites or removes. Not
+			// idempotent: each call adds a new entry with a fresh ULID.
+			DestructiveHint: boolPtr(false),
+			OpenWorldHint:   closedWorld,
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
 		raw, err := json.Marshal(args.Content)
 		if err != nil {
@@ -137,6 +171,11 @@ func registerTools(server *mcp.Server, store *Store) {
 			"If `jq` is set, each entry is piped through the jq filter and the filter's " +
 			"outputs are collected (e.g. `select(.content.tag == \"espresso\")`). If `last` " +
 			"is set, only the final N results (post-jq) are returned.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "Get entries",
+			ReadOnlyHint:  true,
+			OpenWorldHint: closedWorld,
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args getArgs) (*mcp.CallToolResult, getResult, error) {
 		entries, err := store.Get(args.Namespace, args.Jq, args.Last)
 		if err != nil {
@@ -150,6 +189,12 @@ func registerTools(server *mcp.Server, store *Store) {
 		Description: "Tombstone an entry by ID. The underlying JSONL is never rewritten; the ID is " +
 			"recorded in a per-namespace tombstone file and filtered out of subsequent reads. " +
 			"Idempotent.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Delete entry",
+			DestructiveHint: boolPtr(true),
+			IdempotentHint:  true,
+			OpenWorldHint:   closedWorld,
+		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteArgs) (*mcp.CallToolResult, deleteResult, error) {
 		if err := store.Delete(args.Namespace, args.ID); err != nil {
 			return nil, deleteResult{}, err
