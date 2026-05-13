@@ -8,9 +8,13 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// Content accepts any JSON value (string, number, object, array, null) and is
+// marshalled at handler time. `any` is used rather than json.RawMessage
+// because the SDK's schema inferer treats RawMessage as []byte and emits
+// type: [null, array], rejecting objects at the protocol layer.
 type appendArgs struct {
-	Namespace string          `json:"namespace" jsonschema:"namespace name; created on first append; alphanumeric, dash, underscore; up to 64 chars"`
-	Content   json.RawMessage `json:"content" jsonschema:"any JSON value (string, number, object, array, null)"`
+	Namespace string `json:"namespace" jsonschema:"namespace name; created on first append; alphanumeric, dash, underscore; up to 64 chars"`
+	Content   any    `json:"content" jsonschema:"any JSON value (string, number, object, array, null)"`
 }
 
 type appendResult struct {
@@ -63,10 +67,11 @@ func registerTools(server *mcp.Server, store *Store) {
 			"number, object, array, null). Returns the assigned ULID and UTC timestamp. The " +
 			"namespace is created on first append.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
-		if len(args.Content) == 0 {
-			return nil, appendResult{}, fmt.Errorf("content is required")
+		raw, err := json.Marshal(args.Content)
+		if err != nil {
+			return nil, appendResult{}, fmt.Errorf("marshal content: %w", err)
 		}
-		entry, err := store.Append(args.Namespace, args.Content)
+		entry, err := store.Append(args.Namespace, raw)
 		if err != nil {
 			return nil, appendResult{}, err
 		}
