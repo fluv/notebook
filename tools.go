@@ -103,7 +103,8 @@ func registerTools(server *mcp.Server, store *Store) {
 		Description: "Return entry count, tombstoned count, and timestamp range for a namespace. " +
 			"If `field` is set, also returns distinct values emitted by that jq expression with " +
 			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often " +
-			"it appears). Answers \"what's in here\" without reading every entry.",
+			"it appears). Answers \"what's in here\" in a single pass, without returning the " +
+			"entries themselves.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args describeArgs) (*mcp.CallToolResult, describeResult, error) {
 		d, err := store.Describe(args.Namespace, args.Field)
 		if err != nil {
