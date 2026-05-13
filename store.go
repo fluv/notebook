@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -286,10 +287,10 @@ func (s *Store) Get(ns string, jqFilter string, last int) ([]any, error) {
 	return results, nil
 }
 
-// ListNamespaces returns the names of namespaces that have at least one
+// ListNamespaceNames returns the names of namespaces that have at least one
 // JSONL file on disk. Tombstone-only namespaces (deleted before any entry
 // existed) are not listed.
-func (s *Store) ListNamespaces() ([]string, error) {
+func (s *Store) ListNamespaceNames() ([]string, error) {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return nil, err
@@ -306,4 +307,185 @@ func (s *Store) ListNamespaces() ([]string, error) {
 		names = append(names, strings.TrimSuffix(name, ".jsonl"))
 	}
 	return names, nil
+}
+
+// NamespaceSummary is the minimal at-a-glance shape: name, live entry
+// count, and the timestamp of the most recent live entry. Tombstoned
+// entries are excluded from both counts and timestamp.
+type NamespaceSummary struct {
+	Name       string `json:"name"`
+	EntryCount int    `json:"entry_count"`
+	LastTS     string `json:"last_ts,omitempty"`
+}
+
+// DistinctValue is one row in a distinct-values report.
+type DistinctValue struct {
+	Value any `json:"value"`
+	Count int `json:"count"`
+}
+
+// NamespaceDescription is the deeper shape returned by Describe: counts
+// (live and tombstoned), the timestamp range, and — if a jq field
+// expression was supplied — distinct values emitted by the field and
+// their occurrence counts.
+type NamespaceDescription struct {
+	Namespace  string          `json:"namespace"`
+	EntryCount int             `json:"entry_count"`
+	Tombstoned int             `json:"tombstoned"`
+	FirstTS    string          `json:"first_ts,omitempty"`
+	LastTS     string          `json:"last_ts,omitempty"`
+	Field      string          `json:"field,omitempty"`
+	Distinct   []DistinctValue `json:"distinct,omitempty"`
+}
+
+// inspect walks a single namespace once, applying an optional jq
+// expression and aggregating distinct outputs. Returns zero values for
+// a non-existent namespace (treating it as empty rather than an error).
+func (s *Store) inspect(ns string, jqField string) (NamespaceDescription, error) {
+	if err := validateNamespace(ns); err != nil {
+		return NamespaceDescription{}, err
+	}
+
+	mu := s.lockFor(ns)
+	mu.Lock()
+	defer mu.Unlock()
+
+	tombstones, err := s.loadTombstones(ns)
+	if err != nil {
+		return NamespaceDescription{}, fmt.Errorf("load tombstones: %w", err)
+	}
+
+	var query *gojq.Query
+	if jqField != "" {
+		q, err := gojq.Parse(jqField)
+		if err != nil {
+			return NamespaceDescription{}, fmt.Errorf("parse jq field: %w", err)
+		}
+		query = q
+	}
+
+	desc := NamespaceDescription{
+		Namespace: ns,
+		Field:     jqField,
+	}
+
+	f, err := os.Open(s.jsonlPath(ns))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return desc, nil
+		}
+		return NamespaceDescription{}, fmt.Errorf("open jsonl: %w", err)
+	}
+	defer f.Close()
+
+	// Distinct aggregation: marshal each emitted value to canonical JSON
+	// and use that as the map key. Track first-seen actual value for
+	// readable output. Stable: identical values land in the same bucket
+	// regardless of underlying Go type.
+	type bucket struct {
+		value any
+		count int
+	}
+	buckets := map[string]*bucket{}
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		raw := scanner.Bytes()
+		if len(raw) == 0 {
+			continue
+		}
+		var entry Entry
+		if err := json.Unmarshal(raw, &entry); err != nil {
+			return NamespaceDescription{}, fmt.Errorf("parse line %d: %w", lineNo, err)
+		}
+		if _, dead := tombstones[entry.ID]; dead {
+			desc.Tombstoned++
+			continue
+		}
+		desc.EntryCount++
+		if desc.FirstTS == "" || entry.TS < desc.FirstTS {
+			desc.FirstTS = entry.TS
+		}
+		if entry.TS > desc.LastTS {
+			desc.LastTS = entry.TS
+		}
+		if query == nil {
+			continue
+		}
+		var generic any
+		if err := json.Unmarshal(raw, &generic); err != nil {
+			return NamespaceDescription{}, fmt.Errorf("decode line %d for jq: %w", lineNo, err)
+		}
+		iter := query.Run(generic)
+		for {
+			v, ok := iter.Next()
+			if !ok {
+				break
+			}
+			if err, isErr := v.(error); isErr {
+				return NamespaceDescription{}, fmt.Errorf("jq error on line %d: %w", lineNo, err)
+			}
+			key, kerr := json.Marshal(v)
+			if kerr != nil {
+				return NamespaceDescription{}, fmt.Errorf("marshal jq output line %d: %w", lineNo, kerr)
+			}
+			if b, ok := buckets[string(key)]; ok {
+				b.count++
+			} else {
+				buckets[string(key)] = &bucket{value: v, count: 1}
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return NamespaceDescription{}, fmt.Errorf("scan jsonl: %w", err)
+	}
+
+	if query != nil {
+		desc.Distinct = make([]DistinctValue, 0, len(buckets))
+		for _, b := range buckets {
+			desc.Distinct = append(desc.Distinct, DistinctValue{Value: b.value, Count: b.count})
+		}
+		sort.Slice(desc.Distinct, func(i, j int) bool {
+			if desc.Distinct[i].Count != desc.Distinct[j].Count {
+				return desc.Distinct[i].Count > desc.Distinct[j].Count
+			}
+			ki, _ := json.Marshal(desc.Distinct[i].Value)
+			kj, _ := json.Marshal(desc.Distinct[j].Value)
+			return string(ki) < string(kj)
+		})
+	}
+	return desc, nil
+}
+
+// Describe returns a NamespaceDescription for one namespace. If field is
+// non-empty it is parsed as a jq expression and applied to each live
+// entry; emitted values are aggregated into Distinct.
+func (s *Store) Describe(ns string, field string) (NamespaceDescription, error) {
+	return s.inspect(ns, field)
+}
+
+// ListNamespaces returns a NamespaceSummary for every namespace with a
+// JSONL file on disk. Walks each file once.
+func (s *Store) ListNamespaces() ([]NamespaceSummary, error) {
+	names, err := s.ListNamespaceNames()
+	if err != nil {
+		return nil, err
+	}
+	sort.Strings(names)
+	out := make([]NamespaceSummary, 0, len(names))
+	for _, name := range names {
+		d, err := s.inspect(name, "")
+		if err != nil {
+			return nil, fmt.Errorf("summarise %s: %w", name, err)
+		}
+		out = append(out, NamespaceSummary{
+			Name:       name,
+			EntryCount: d.EntryCount,
+			LastTS:     d.LastTS,
+		})
+	}
+	return out, nil
 }

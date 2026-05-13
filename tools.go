@@ -43,9 +43,10 @@ var appendInputSchema = &jsonschema.Schema{
 	Required: []string{"namespace", "content"},
 }
 
+// appendResult echoes the stored entry in full. Callers can confirm what
+// landed on disk without a follow-up read.
 type appendResult struct {
-	ID string `json:"id" jsonschema:"ULID of the appended entry"`
-	TS string `json:"ts" jsonschema:"RFC3339Nano UTC timestamp"`
+	Entry Entry `json:"entry" jsonschema:"the entry that was just stored, including id, ts, and content"`
 }
 
 type getArgs struct {
@@ -70,15 +71,25 @@ type deleteResult struct {
 type listNamespacesArgs struct{}
 
 type listNamespacesResult struct {
-	Namespaces []string `json:"namespaces"`
+	Namespaces []NamespaceSummary `json:"namespaces" jsonschema:"summary per namespace: name, entry_count, last_ts"`
 }
 
-// registerTools wires the four notebook tools onto the MCP server. Each
-// handler is a thin shim that validates input and delegates to the store.
+type describeArgs struct {
+	Namespace string `json:"namespace" jsonschema:"namespace to inspect"`
+	Field     string `json:"field,omitempty" jsonschema:"optional jq expression; if set, distinct emitted values are aggregated with counts (e.g. '.content.tag')"`
+}
+
+type describeResult struct {
+	NamespaceDescription
+}
+
+// registerTools wires the notebook tools onto the MCP server. Each handler
+// is a thin shim that validates input and delegates to the store.
 func registerTools(server *mcp.Server, store *Store) {
 	mcp.AddTool(server, &mcp.Tool{
-		Name:        "list_namespaces",
-		Description: "List notebook namespaces that currently exist (i.e. have at least one entry on disk).",
+		Name: "list_namespaces",
+		Description: "List notebook namespaces with summary info (entry count, last-updated timestamp) " +
+			"for each. Tombstoned entries are excluded from the count.",
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ listNamespacesArgs) (*mcp.CallToolResult, listNamespacesResult, error) {
 		ns, err := store.ListNamespaces()
 		if err != nil {
@@ -88,10 +99,24 @@ func registerTools(server *mcp.Server, store *Store) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
+		Name: "describe_namespace",
+		Description: "Return entry count, tombstoned count, and timestamp range for a namespace. " +
+			"If `field` is set, also returns distinct values emitted by that jq expression with " +
+			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often " +
+			"it appears). Answers \"what's in here\" without reading every entry.",
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args describeArgs) (*mcp.CallToolResult, describeResult, error) {
+		d, err := store.Describe(args.Namespace, args.Field)
+		if err != nil {
+			return nil, describeResult{}, err
+		}
+		return nil, describeResult{NamespaceDescription: d}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
 		Name: "append",
 		Description: "Append a content value to a namespace. Content may be any JSON value (string, " +
-			"number, object, array, null). Returns the assigned ULID and UTC timestamp. The " +
-			"namespace is created on first append.",
+			"number, object, array, null). Returns the stored entry in full so the caller can " +
+			"confirm what landed without a follow-up read. The namespace is created on first append.",
 		InputSchema: appendInputSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
 		raw, err := json.Marshal(args.Content)
@@ -102,7 +127,7 @@ func registerTools(server *mcp.Server, store *Store) {
 		if err != nil {
 			return nil, appendResult{}, err
 		}
-		return nil, appendResult{ID: entry.ID, TS: entry.TS}, nil
+		return nil, appendResult{Entry: entry}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
