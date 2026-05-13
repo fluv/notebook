@@ -2,7 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 )
@@ -171,22 +170,86 @@ func TestGet_InvalidJqReturnsError(t *testing.T) {
 	}
 }
 
-func TestListNamespaces(t *testing.T) {
+func TestListNamespaces_ReturnsSummaries(t *testing.T) {
 	s := newTestStore(t)
 	_, _ = s.Append("alpha", mustJSON(t, 1))
-	_, _ = s.Append("beta", mustJSON(t, 2))
-	_, _ = s.Append("gamma", mustJSON(t, 3))
+	_, _ = s.Append("alpha", mustJSON(t, 2))
+	_, _ = s.Append("beta", mustJSON(t, 3))
 	ns, err := s.ListNamespaces()
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	want := map[string]bool{"alpha": true, "beta": true, "gamma": true}
-	got := map[string]bool{}
+	got := map[string]int{}
 	for _, n := range ns {
-		got[n] = true
+		got[n.Name] = n.EntryCount
+		if n.LastTS == "" {
+			t.Errorf("expected last_ts on %s", n.Name)
+		}
 	}
-	if !reflect.DeepEqual(want, got) {
-		t.Errorf("expected %v, got %v", want, got)
+	if got["alpha"] != 2 {
+		t.Errorf("alpha count: got %d, want 2", got["alpha"])
+	}
+	if got["beta"] != 1 {
+		t.Errorf("beta count: got %d, want 1", got["beta"])
+	}
+}
+
+func TestDescribe_BasicCounts(t *testing.T) {
+	s := newTestStore(t)
+	e1, _ := s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}))
+	_ = s.Delete("scratch", e1.ID)
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if d.EntryCount != 2 {
+		t.Errorf("entry_count: got %d, want 2", d.EntryCount)
+	}
+	if d.Tombstoned != 1 {
+		t.Errorf("tombstoned: got %d, want 1", d.Tombstoned)
+	}
+	if d.FirstTS == "" || d.LastTS == "" {
+		t.Errorf("expected ts range, got first=%q last=%q", d.FirstTS, d.LastTS)
+	}
+	if len(d.Distinct) != 0 {
+		t.Errorf("expected no distinct without field, got %v", d.Distinct)
+	}
+}
+
+func TestDescribe_DistinctValuesOnField(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+
+	d, err := s.Describe("scratch", ".content.tag")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if len(d.Distinct) != 2 {
+		t.Fatalf("expected 2 distinct tags, got %d (%v)", len(d.Distinct), d.Distinct)
+	}
+	// Sorted by count desc, so espresso (3) comes first.
+	if d.Distinct[0].Value != "espresso" || d.Distinct[0].Count != 3 {
+		t.Errorf("first distinct: got %+v, want {espresso 3}", d.Distinct[0])
+	}
+	if d.Distinct[1].Value != "filter" || d.Distinct[1].Count != 1 {
+		t.Errorf("second distinct: got %+v, want {filter 1}", d.Distinct[1])
+	}
+}
+
+func TestDescribe_EmptyNamespace(t *testing.T) {
+	s := newTestStore(t)
+	d, err := s.Describe("never-touched", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if d.EntryCount != 0 || d.Tombstoned != 0 || d.FirstTS != "" || d.LastTS != "" {
+		t.Errorf("expected zero values, got %+v", d)
 	}
 }
 
