@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -13,8 +14,33 @@ import (
 // because the SDK's schema inferer treats RawMessage as []byte and emits
 // type: [null, array], rejecting objects at the protocol layer.
 type appendArgs struct {
-	Namespace string `json:"namespace" jsonschema:"namespace name; created on first append; alphanumeric, dash, underscore; up to 64 chars"`
-	Content   any    `json:"content" jsonschema:"any JSON value (string, number, object, array, null)"`
+	Namespace string `json:"namespace"`
+	Content   any    `json:"content"`
+}
+
+// appendInputSchema overrides the SDK's auto-generated schema. The inferer
+// emits no `type` for an `any` field — just a description. Claude.ai (and
+// likely other clients) interpret a typeless property as "send a string"
+// and JSON-encode the value before transmission. The result on disk is a
+// stringified JSON blob inside .content rather than a structured object,
+// which forces jq filters into `.content | fromjson | .field`.
+//
+// Declaring an explicit multi-type schema tells the client every JSON
+// kind is acceptable, so structured payloads stay structured on the wire
+// and at rest.
+var appendInputSchema = &jsonschema.Schema{
+	Type: "object",
+	Properties: map[string]*jsonschema.Schema{
+		"namespace": {
+			Type:        "string",
+			Description: "namespace name; created on first append; alphanumeric, dash, underscore; up to 64 chars",
+		},
+		"content": {
+			Types:       []string{"object", "array", "string", "number", "boolean", "null"},
+			Description: "any JSON value — object/array/string/number/boolean/null. Send the value structurally; do not pre-serialize.",
+		},
+	},
+	Required: []string{"namespace", "content"},
 }
 
 type appendResult struct {
@@ -66,6 +92,7 @@ func registerTools(server *mcp.Server, store *Store) {
 		Description: "Append a content value to a namespace. Content may be any JSON value (string, " +
 			"number, object, array, null). Returns the assigned ULID and UTC timestamp. The " +
 			"namespace is created on first append.",
+		InputSchema: appendInputSchema,
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
 		raw, err := json.Marshal(args.Content)
 		if err != nil {
