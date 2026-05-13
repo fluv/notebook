@@ -24,11 +24,17 @@ import (
 var namespaceRE = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]{0,63}$`)
 
 // Entry is the canonical on-disk shape of one notebook record. Content is
-// preserved verbatim as the caller submitted it.
+// preserved as the caller submitted it.
+//
+// Content is `any`, not json.RawMessage. The SDK's schema inferer treats
+// RawMessage as []byte and emits type: [null, array], which causes both
+// input AND output validation to reject object payloads. `any` produces
+// a permissive schema and round-trips structured values cleanly through
+// json.Marshal / json.Unmarshal.
 type Entry struct {
-	ID      string          `json:"id"`
-	TS      string          `json:"ts"`
-	Content json.RawMessage `json:"content"`
+	ID      string `json:"id"`
+	TS      string `json:"ts"`
+	Content any    `json:"content"`
 }
 
 // Store is a single-replica, append-only JSONL store with per-namespace
@@ -100,14 +106,12 @@ func (s *Store) newID(t time.Time) (string, error) {
 	return id.String(), nil
 }
 
-// Append serialises a new entry to the namespace's JSONL file. Content is
-// stored as-is (any valid JSON value: string, number, object, array, null).
-func (s *Store) Append(ns string, content json.RawMessage) (Entry, error) {
+// Append serialises a new entry to the namespace's JSONL file. Content
+// may be any JSON value (string, number, object, array, null). The
+// caller passes a native Go value; Append marshals it.
+func (s *Store) Append(ns string, content any) (Entry, error) {
 	if err := validateNamespace(ns); err != nil {
 		return Entry{}, err
-	}
-	if !json.Valid(content) {
-		return Entry{}, errors.New("content is not valid JSON")
 	}
 
 	now := time.Now().UTC()

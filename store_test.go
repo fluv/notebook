@@ -129,10 +129,11 @@ func TestGet_LastTakesFinalN(t *testing.T) {
 	if len(results) != 2 {
 		t.Fatalf("expected 2 results, got %d", len(results))
 	}
-	// Last two should be content=3 and content=4
+	// Last two should be content=3 and content=4. json.Unmarshal of integers
+	// into `any` produces float64 per the Go JSON convention.
 	last := results[len(results)-1].(Entry)
-	if string(last.Content) != "4" {
-		t.Errorf("expected final entry content=4, got %s", last.Content)
+	if got, _ := last.Content.(float64); got != 4 {
+		t.Errorf("expected final entry content=4, got %v", last.Content)
 	}
 }
 
