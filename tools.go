@@ -2,8 +2,6 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -154,11 +152,7 @@ func registerTools(server *mcp.Server, store *Store) {
 			OpenWorldHint:   closedWorld,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
-		raw, err := json.Marshal(args.Content)
-		if err != nil {
-			return nil, appendResult{}, fmt.Errorf("marshal content: %w", err)
-		}
-		entry, err := store.Append(args.Namespace, raw)
+		entry, err := store.Append(args.Namespace, args.Content)
 		if err != nil {
 			return nil, appendResult{}, err
 		}
