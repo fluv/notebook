@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -110,7 +111,9 @@ func registerTools(server *mcp.Server, store *Store) {
 			OpenWorldHint: closedWorld,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ listNamespacesArgs) (*mcp.CallToolResult, listNamespacesResult, error) {
+		start := time.Now()
 		ns, err := store.ListNamespaces()
+		recordCall("list_namespaces", start, err)
 		if err != nil {
 			return nil, listNamespacesResult{}, err
 		}
@@ -130,7 +133,9 @@ func registerTools(server *mcp.Server, store *Store) {
 			OpenWorldHint: closedWorld,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args describeArgs) (*mcp.CallToolResult, describeResult, error) {
+		start := time.Now()
 		d, err := store.Describe(args.Namespace, args.Field)
+		recordCall("describe_namespace", start, err)
 		if err != nil {
 			return nil, describeResult{}, err
 		}
@@ -152,7 +157,9 @@ func registerTools(server *mcp.Server, store *Store) {
 			OpenWorldHint:   closedWorld,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
+		start := time.Now()
 		entry, err := store.Append(args.Namespace, args.Content)
+		recordCall("append", start, err)
 		if err != nil {
 			return nil, appendResult{}, err
 		}
@@ -171,7 +178,9 @@ func registerTools(server *mcp.Server, store *Store) {
 			OpenWorldHint: closedWorld,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args getArgs) (*mcp.CallToolResult, getResult, error) {
+		start := time.Now()
 		entries, err := store.Get(args.Namespace, args.Jq, args.Last)
+		recordCall("get", start, err)
 		if err != nil {
 			return nil, getResult{}, err
 		}
@@ -190,7 +199,10 @@ func registerTools(server *mcp.Server, store *Store) {
 			OpenWorldHint:   closedWorld,
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteArgs) (*mcp.CallToolResult, deleteResult, error) {
-		if err := store.Delete(args.Namespace, args.ID); err != nil {
+		start := time.Now()
+		err := store.Delete(args.Namespace, args.ID)
+		recordCall("delete", start, err)
+		if err != nil {
 			return nil, deleteResult{}, err
 		}
 		return nil, deleteResult{OK: true}, nil
