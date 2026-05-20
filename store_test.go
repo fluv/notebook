@@ -68,6 +68,83 @@ func TestAppend_RejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestAppendMany_RoundTrip(t *testing.T) {
+	s := newTestStore(t)
+	contents := []any{
+		map[string]any{"tag": "espresso", "shot": 18.0},
+		"a free-text note",
+		42.0,
+	}
+	entries, err := s.AppendMany("scratch", contents)
+	if err != nil {
+		t.Fatalf("AppendMany: %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 entries, got %d", len(entries))
+	}
+	ids := map[string]bool{}
+	for _, e := range entries {
+		if e.ID == "" || e.TS == "" {
+			t.Fatalf("entry missing ID or TS: %+v", e)
+		}
+		ids[e.ID] = true
+	}
+	if len(ids) != 3 {
+		t.Error("expected all IDs to be distinct")
+	}
+
+	results, err := s.Get("scratch", "", 0)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 3 {
+		t.Fatalf("expected 3 stored entries, got %d", len(results))
+	}
+}
+
+func TestAppendMany_Empty(t *testing.T) {
+	s := newTestStore(t)
+	entries, err := s.AppendMany("scratch", nil)
+	if err != nil {
+		t.Fatalf("AppendMany(nil): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 entries, got %d", len(entries))
+	}
+	entries, err = s.AppendMany("scratch", []any{})
+	if err != nil {
+		t.Fatalf("AppendMany([]): %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("expected 0 entries, got %d", len(entries))
+	}
+}
+
+func TestAppendMany_ULIDsAreMonotonic(t *testing.T) {
+	s := newTestStore(t)
+	contents := make([]any, 10)
+	for i := range contents {
+		contents[i] = i
+	}
+	entries, err := s.AppendMany("scratch", contents)
+	if err != nil {
+		t.Fatalf("AppendMany: %v", err)
+	}
+	for i := 1; i < len(entries); i++ {
+		if entries[i].ID <= entries[i-1].ID {
+			t.Errorf("ULIDs not monotonically increasing at index %d: %s <= %s",
+				i, entries[i].ID, entries[i-1].ID)
+		}
+	}
+}
+
+func TestAppendMany_RejectsInvalidNamespace(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.AppendMany("with/slash", []any{"x"}); err == nil {
+		t.Error("expected error for invalid namespace")
+	}
+}
+
 func TestDelete_TombstoneHidesEntry(t *testing.T) {
 	s := newTestStore(t)
 	entry, err := s.Append("scratch", mustJSON(t, "doomed"))
