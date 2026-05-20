@@ -31,6 +31,15 @@ rely on. Changing the entry shape (renaming fields, switching ID
 formats) is a breaking change for any consumer that's persisted IDs
 externally — it needs a versioned migration, not an in-place edit.
 
+Versioning
+----------
+
+Bump `serverVersion` in `main.go` on every PR that adds or removes tools,
+changes tool signatures, or alters on-disk storage behaviour. Minor bump
+for new/changed tools; patch for bug fixes only. The version surfaces in
+`/healthz`, the MCP `initialize` handshake, and the startup log — it's
+the fastest way to confirm which build is live.
+
 Style
 -----
 
