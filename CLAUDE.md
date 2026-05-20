@@ -42,14 +42,6 @@ Style
 - `main.go` is the reader's entry point. Don't bury core logic behind
   layers of indirection.
 
-Transport: streamable HTTP only
--------------------------------
-
-Serves streamable HTTP on `/mcp`, with `JSONResponse: true` (plain JSON,
-no SSE framing). Do not add stdio (developer-laptop inspection only)
-and do not enable SSE — ingress-nginx buffering makes SSE unreliable
-in this cluster (see `vestibule-mcp/CLAUDE.md` for the precedent).
-
 Namespace validation
 --------------------
 
