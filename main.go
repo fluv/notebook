@@ -18,7 +18,7 @@ import (
 
 const (
 	serverName    = "notebook"
-	serverVersion = "0.3.0"
+	serverVersion = "0.3.1"
 	defaultPort   = 8080
 	defaultDir    = "/data"
 )
