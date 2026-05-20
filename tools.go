@@ -75,11 +75,22 @@ type listNamespacesResult struct {
 
 type describeArgs struct {
 	Namespace string `json:"namespace" jsonschema:"namespace to inspect"`
-	Field     string `json:"field,omitempty" jsonschema:"optional jq expression; if set, distinct emitted values are aggregated with counts (e.g. '.content.tag')"`
+	Field     string `json:"field,omitempty" jsonschema:"optional jq expression; if set, distinct emitted values are aggregated with counts (e.g. '.content.tag'); if omitted, an inferred schema digest is returned instead"`
 }
 
 type describeResult struct {
 	NamespaceDescription
+}
+
+type searchArgs struct {
+	Query     string `json:"query" jsonschema:"substring or regex to search for in raw entry JSON"`
+	Namespace string `json:"namespace,omitempty" jsonschema:"namespace to search; omit to search all namespaces"`
+	Regex     bool   `json:"regex,omitempty" jsonschema:"when true, treat query as a Go regular expression"`
+	Limit     int    `json:"limit,omitempty" jsonschema:"maximum number of hits to return; defaults to 20"`
+}
+
+type searchResult struct {
+	Hits []SearchHit `json:"hits"`
 }
 
 // boolPtr is a small helper for *bool fields in ToolAnnotations (the SDK
@@ -123,10 +134,12 @@ func registerTools(server *mcp.Server, store *Store) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "describe_namespace",
 		Description: "Return entry count, tombstoned count, and timestamp range for a namespace. " +
-			"If `field` is set, also returns distinct values emitted by that jq expression with " +
-			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often " +
-			"it appears). Answers \"what's in here\" in a single pass, without returning the " +
-			"entries themselves.",
+			"If `field` is set, distinct values emitted by that jq expression are returned with " +
+			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often it " +
+			"appears). If `field` is omitted, a schema digest is inferred from live entries: for " +
+			"each field path up to depth 2, the types seen, occurrence count, distinct value count, " +
+			"and up to 3 sample values are returned. Answers \"what's in here\" in a single pass " +
+			"without returning the entries themselves.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:         "Describe namespace",
 			ReadOnlyHint:  true,
@@ -206,5 +219,27 @@ func registerTools(server *mcp.Server, store *Store) {
 			return nil, deleteResult{}, err
 		}
 		return nil, deleteResult{OK: true}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "search",
+		Description: "Scan one or all namespaces for entries whose raw JSON contains a match. " +
+			"Matching is substring by default; set `regex` to use a Go regular expression. " +
+			"Tombstoned entries are skipped. Returns up to `limit` hits (default 20), each " +
+			"with namespace, id, ts, and a ~120-character snippet centred on the first match. " +
+			"The search runs against raw JSONL so it also matches on id and ts fields.",
+		Annotations: &mcp.ToolAnnotations{
+			Title:         "Search entries",
+			ReadOnlyHint:  true,
+			OpenWorldHint: closedWorld,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, searchResult, error) {
+		start := time.Now()
+		hits, err := store.Search(args.Query, args.Namespace, args.Regex, args.Limit)
+		recordCall("search", start, err)
+		if err != nil {
+			return nil, searchResult{}, err
+		}
+		return nil, searchResult{Hits: hits}, nil
 	})
 }

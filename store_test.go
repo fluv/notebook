@@ -278,3 +278,208 @@ func TestPersistence_AcrossStoreReopen(t *testing.T) {
 		t.Errorf("expected id %s, got %s", entry.ID, got.ID)
 	}
 }
+
+// ---- describe_namespace auto-shape tests ----
+
+func TestDescribe_Shape_InfersSchema(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter", "shot": 22.0}))
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if len(d.Shape) == 0 {
+		t.Fatal("expected shape, got none")
+	}
+	byPath := map[string]FieldShape{}
+	for _, fs := range d.Shape {
+		byPath[fs.Path] = fs
+	}
+	tag, ok := byPath[".content.tag"]
+	if !ok {
+		t.Fatalf("expected .content.tag in shape; got paths: %v", func() []string {
+			ps := make([]string, 0, len(byPath))
+			for p := range byPath {
+				ps = append(ps, p)
+			}
+			return ps
+		}())
+	}
+	if tag.Count != 2 {
+		t.Errorf(".content.tag count: got %d, want 2", tag.Count)
+	}
+	if tag.DistinctCount != 2 {
+		t.Errorf(".content.tag distinct_count: got %d, want 2", tag.DistinctCount)
+	}
+	if len(tag.Types) != 1 || tag.Types[0] != "string" {
+		t.Errorf(".content.tag types: got %v, want [string]", tag.Types)
+	}
+	if len(tag.SampleValues) == 0 {
+		t.Error(".content.tag: expected sample values")
+	}
+}
+
+func TestDescribe_Shape_MixedTypes(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"val": "hello"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"val": 42.0}))
+	_, _ = s.Append("scratch", mustJSON(t, "just a string")) // non-object content
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	byPath := map[string]FieldShape{}
+	for _, fs := range d.Shape {
+		byPath[fs.Path] = fs
+	}
+
+	val, ok := byPath[".content.val"]
+	if !ok {
+		t.Fatalf("expected .content.val in shape")
+	}
+	if len(val.Types) != 2 {
+		t.Errorf(".content.val types: got %v, want [number string]", val.Types)
+	}
+
+	// The primitive "just a string" entry should contribute to .content directly.
+	contentField, ok := byPath[".content"]
+	if !ok {
+		t.Fatalf("expected .content in shape for primitive entry")
+	}
+	if len(contentField.Types) != 1 || contentField.Types[0] != "string" {
+		t.Errorf(".content types: got %v, want [string]", contentField.Types)
+	}
+}
+
+func TestDescribe_Shape_NotSetWhenFieldGiven(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "x"}))
+
+	d, err := s.Describe("scratch", ".content.tag")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if len(d.Shape) != 0 {
+		t.Errorf("expected no shape when field is given, got %v", d.Shape)
+	}
+	if len(d.Distinct) == 0 {
+		t.Error("expected distinct values when field is given")
+	}
+}
+
+// ---- search tests ----
+
+func TestSearch_SubstringHit(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "best espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "filter coffee"}))
+
+	hits, err := s.Search("espresso", "scratch", false, 0)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if !strings.Contains(hits[0].Snippet, "espresso") {
+		t.Errorf("snippet missing match text: %q", hits[0].Snippet)
+	}
+	if hits[0].ID == "" || hits[0].TS == "" {
+		t.Error("expected non-empty id and ts on hit")
+	}
+}
+
+func TestSearch_RegexHit(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "shot 18g"))
+	_, _ = s.Append("scratch", mustJSON(t, "shot 22g"))
+	_, _ = s.Append("scratch", mustJSON(t, "no match here"))
+
+	hits, err := s.Search(`shot \d+g`, "scratch", true, 0)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 regex hits, got %d", len(hits))
+	}
+}
+
+func TestSearch_SkipsTombstoned(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, "doomed espresso"))
+	_, _ = s.Append("scratch", mustJSON(t, "survivor"))
+	_ = s.Delete("scratch", e.ID)
+
+	hits, err := s.Search("espresso", "scratch", false, 0)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits (tombstoned entry excluded), got %d", len(hits))
+	}
+}
+
+func TestSearch_AllNamespaces(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("alpha", mustJSON(t, "espresso here"))
+	_, _ = s.Append("beta", mustJSON(t, "espresso there"))
+	_, _ = s.Append("gamma", mustJSON(t, "no match"))
+
+	hits, err := s.Search("espresso", "", false, 0)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("expected 2 hits across namespaces, got %d", len(hits))
+	}
+	ns := map[string]bool{}
+	for _, h := range hits {
+		ns[h.Namespace] = true
+	}
+	if !ns["alpha"] || !ns["beta"] {
+		t.Errorf("expected hits in alpha and beta; got namespaces: %v", ns)
+	}
+}
+
+func TestSearch_LimitCaps(t *testing.T) {
+	s := newTestStore(t)
+	for range 5 {
+		_, _ = s.Append("scratch", mustJSON(t, "entry"))
+	}
+	hits, err := s.Search("entry", "scratch", false, 3)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 3 {
+		t.Fatalf("expected 3 hits (limit=3), got %d", len(hits))
+	}
+}
+
+func TestSearch_EmptyQueryError(t *testing.T) {
+	s := newTestStore(t)
+	if _, err := s.Search("", "scratch", false, 0); err == nil {
+		t.Error("expected error for empty query")
+	}
+}
+
+func TestSearch_InvalidRegexError(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "x"))
+	if _, err := s.Search(`[invalid`, "scratch", true, 0); err == nil {
+		t.Error("expected error for invalid regex")
+	}
+}
+
+func TestSearch_EmptyNamespaceReturnsEmpty(t *testing.T) {
+	s := newTestStore(t)
+	hits, err := s.Search("anything", "never-touched", false, 0)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("expected 0 hits for empty namespace, got %d", len(hits))
+	}
+}
