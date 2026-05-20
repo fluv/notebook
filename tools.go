@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -190,7 +191,15 @@ func registerTools(server *mcp.Server, store *Store) {
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
 		start := time.Now()
-		if args.Entries != nil {
+		hasBulk := args.Entries != nil
+		hasSingle := args.Content != nil
+		if hasBulk && hasSingle {
+			return nil, appendResult{}, errors.New("provide content OR entries, not both")
+		}
+		if !hasBulk && !hasSingle {
+			return nil, appendResult{}, errors.New("provide either content (single value) or entries (array of values)")
+		}
+		if hasBulk {
 			entries, err := store.AppendMany(args.Namespace, args.Entries)
 			recordCall("append", start, err)
 			if err != nil {
