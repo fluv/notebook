@@ -138,8 +138,9 @@ func registerTools(server *mcp.Server, store *Store) {
 			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often it " +
 			"appears). If `field` is omitted, a schema digest is inferred from live entries: for " +
 			"each field path up to depth 2, the types seen, occurrence count, distinct value count, " +
-			"and up to 3 sample values are returned. Answers \"what's in here\" in a single pass " +
-			"without returning the entries themselves.",
+			"and up to 3 sample values are returned. Array-valued fields are recorded as type " +
+			"\"array\" without traversing their elements. Answers \"what's in here\" in a single " +
+			"pass without returning the entries themselves.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:         "Describe namespace",
 			ReadOnlyHint:  true,

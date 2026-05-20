@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/itchyny/gojq"
 	"github.com/oklog/ulid/v2"
@@ -473,7 +474,7 @@ func pathAccToShape(acc map[string]*pathAcc) []FieldShape {
 // in text, with "..." ellipsis on truncated ends.
 func makeSnippet(text string, matchBytePos, width int) string {
 	runes := []rune(text)
-	runeMatch := len([]rune(text[:matchBytePos]))
+	runeMatch := utf8.RuneCountInString(text[:matchBytePos])
 	half := width / 2
 	start := runeMatch - half
 	if start < 0 {
