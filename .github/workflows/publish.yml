@@ -31,6 +31,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Extract version from main.go
+        id: ver
+        run: |
+          echo "version=$(grep -oP 'serverVersion\s*=\s*"\K[^"]+' main.go)" >> "$GITHUB_OUTPUT"
+
       - name: Derive image metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -38,6 +43,7 @@ jobs:
           images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=${{ steps.ver.outputs.version }},enable=${{ github.ref == 'refs/heads/main' }}
             type=sha,prefix=sha-,format=short
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
