@@ -14,9 +14,15 @@ Tools
 - `describe_namespace(namespace, field=null)` — returns entry count, tombstoned
   count, and timestamp range. If `field` is set (a jq expression such as
   `".content.tag"`), distinct emitted values and their counts are returned.
-  If `field` is omitted, a schema digest is inferred from live entries: for
-  each field path up to depth 2, the types seen, occurrence count, distinct
-  value count, and up to 3 sample values are returned in `shape`.
+  Entries that error under the jq filter are skipped; their count appears in
+  `errored_count` (omitted when zero). If `field` is omitted, a schema digest
+  is inferred from live entries: for each field path up to depth 2, the types
+  seen, occurrence count, distinct value count, and up to 3 sample values are
+  returned in `shape`. String samples are capped at 80 runes (truncated with
+  `"..."`). Object and array values are replaced with type tokens such as
+  `"object (3 keys)"` or `"array[5]"`. Depth-2 paths (e.g. `.content.obj.key`)
+  are omitted unless they appear in ≥2 entries — single-occurrence depth-2
+  paths are typically map keys rather than schema fields.
 - `append(namespace, content)` — appends a content value to a namespace
   (created on first append). Content is any JSON value. Returns
   `{id, ts}` where `id` is a ULID and `ts` is a UTC RFC3339Nano timestamp.
@@ -29,8 +35,11 @@ Tools
   namespaces for entries whose raw JSON contains `query` as a substring (or
   regex when `regex` is true). Tombstoned entries are excluded. Returns up to
   `limit` hits, each with `{namespace, id, ts, snippet}` where `snippet` is
-  a ~120-character context window around the first match. The search runs
-  against raw JSONL, so it also matches on the `id` and `ts` fields.
+  a ~120-character context window around the first match, centred on the
+  content portion of the line where possible (so the `{"id":...,"ts":...}`
+  envelope is excluded from the window unless the match is on those fields).
+  The search runs against raw JSONL, so it also matches on the `id` and `ts`
+  fields.
 
 Storage
 -------

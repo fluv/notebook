@@ -351,14 +351,15 @@ type SearchHit struct {
 // (live and tombstoned), the timestamp range, and either distinct values
 // (when field is set) or an inferred schema digest (when field is omitted).
 type NamespaceDescription struct {
-	Namespace  string          `json:"namespace"`
-	EntryCount int             `json:"entry_count"`
-	Tombstoned int             `json:"tombstoned"`
-	FirstTS    string          `json:"first_ts,omitempty"`
-	LastTS     string          `json:"last_ts,omitempty"`
-	Field      string          `json:"field,omitempty"`
-	Distinct   []DistinctValue `json:"distinct,omitempty"`
-	Shape      []FieldShape    `json:"shape,omitempty"`
+	Namespace    string          `json:"namespace"`
+	EntryCount   int             `json:"entry_count"`
+	Tombstoned   int             `json:"tombstoned"`
+	ErroredCount int             `json:"errored_count,omitempty"`
+	FirstTS      string          `json:"first_ts,omitempty"`
+	LastTS       string          `json:"last_ts,omitempty"`
+	Field        string          `json:"field,omitempty"`
+	Distinct     []DistinctValue `json:"distinct,omitempty"`
+	Shape        []FieldShape    `json:"shape,omitempty"`
 }
 
 // pathAcc accumulates per-path type and value information across entries.
@@ -390,6 +391,26 @@ func jsonType(v any) string {
 	}
 }
 
+// compactSample replaces values that would bloat the shape digest with compact
+// tokens. Strings longer than 80 runes are truncated. Objects and arrays are
+// replaced with type tokens so the digest stays smaller than reading entries.
+func compactSample(v any) any {
+	switch val := v.(type) {
+	case string:
+		runes := []rune(val)
+		if len(runes) > 80 {
+			return string(runes[:80]) + "..."
+		}
+		return val
+	case map[string]any:
+		return fmt.Sprintf("object (%d keys)", len(val))
+	case []any:
+		return fmt.Sprintf("array[%d]", len(val))
+	default:
+		return v
+	}
+}
+
 // recordPath records one observation of path=v into acc.
 func recordPath(acc map[string]*pathAcc, path string, v any) {
 	a, ok := acc[path]
@@ -413,7 +434,7 @@ func recordPath(acc map[string]*pathAcc, path string, v any) {
 	if _, seen := a.distinct[ks]; !seen {
 		a.distinct[ks] = struct{}{}
 		if len(a.samples) < 3 {
-			a.samples = append(a.samples, v)
+			a.samples = append(a.samples, compactSample(v))
 		}
 	}
 }
@@ -448,6 +469,10 @@ func accumulatePaths(acc map[string]*pathAcc, path string, v any, depth int) {
 func pathAccToShape(acc map[string]*pathAcc) []FieldShape {
 	shapes := make([]FieldShape, 0, len(acc))
 	for path, a := range acc {
+		// Depth-2 paths (3 dots) with count=1 are likely map keys (data), not schema fields.
+		if strings.Count(path, ".") >= 3 && a.count < 2 {
+			continue
+		}
 		types := make([]string, 0, len(a.types))
 		for t := range a.types {
 			types = append(types, t)
@@ -558,6 +583,7 @@ func (s *Store) inspect(ns string, jqField string, shapeMode bool) (NamespaceDes
 	scanner := bufio.NewScanner(f)
 	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
 	lineNo := 0
+lineLoop:
 	for scanner.Scan() {
 		lineNo++
 		raw := scanner.Bytes()
@@ -566,7 +592,8 @@ func (s *Store) inspect(ns string, jqField string, shapeMode bool) (NamespaceDes
 		}
 		var entry Entry
 		if err := json.Unmarshal(raw, &entry); err != nil {
-			return NamespaceDescription{}, fmt.Errorf("parse line %d: %w", lineNo, err)
+			desc.ErroredCount++
+			continue
 		}
 		if _, dead := tombstones[entry.ID]; dead {
 			desc.Tombstoned++
@@ -587,7 +614,8 @@ func (s *Store) inspect(ns string, jqField string, shapeMode bool) (NamespaceDes
 		}
 		var generic any
 		if err := json.Unmarshal(raw, &generic); err != nil {
-			return NamespaceDescription{}, fmt.Errorf("decode line %d for jq: %w", lineNo, err)
+			desc.ErroredCount++
+			continue
 		}
 		iter := query.Run(generic)
 		for {
@@ -595,12 +623,14 @@ func (s *Store) inspect(ns string, jqField string, shapeMode bool) (NamespaceDes
 			if !ok {
 				break
 			}
-			if err, isErr := v.(error); isErr {
-				return NamespaceDescription{}, fmt.Errorf("jq error on line %d: %w", lineNo, err)
+			if _, isErr := v.(error); isErr {
+				desc.ErroredCount++
+				continue lineLoop
 			}
 			key, kerr := json.Marshal(v)
 			if kerr != nil {
-				return NamespaceDescription{}, fmt.Errorf("marshal jq output line %d: %w", lineNo, kerr)
+				desc.ErroredCount++
+				continue lineLoop
 			}
 			if b, ok := buckets[string(key)]; ok {
 				b.count++
@@ -711,11 +741,21 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 		if !ok {
 			continue
 		}
+		snippetText := text
+		snippetPos := pos
+		const contentField = `"content":`
+		if ci := strings.Index(text, contentField); ci >= 0 {
+			contentStart := ci + len(contentField)
+			if pos >= contentStart {
+				snippetText = text[contentStart:]
+				snippetPos = pos - contentStart
+			}
+		}
 		hits = append(hits, SearchHit{
 			Namespace: ns,
 			ID:        hdr.ID,
 			TS:        hdr.TS,
-			Snippet:   makeSnippet(text, pos, 120),
+			Snippet:   makeSnippet(snippetText, snippetPos, 120),
 		})
 		if len(hits) >= remaining {
 			break

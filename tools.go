@@ -136,11 +136,14 @@ func registerTools(server *mcp.Server, store *Store) {
 		Description: "Return entry count, tombstoned count, and timestamp range for a namespace. " +
 			"If `field` is set, distinct values emitted by that jq expression are returned with " +
 			"their occurrence counts (e.g. field=\".content.tag\" lists each tag and how often it " +
-			"appears). If `field` is omitted, a schema digest is inferred from live entries: for " +
+			"appears). Entries that error under the jq filter are skipped; their count is in " +
+			"`errored_count`. If `field` is omitted, a schema digest is inferred from live entries: for " +
 			"each field path up to depth 2, the types seen, occurrence count, distinct value count, " +
-			"and up to 3 sample values are returned. Array-valued fields are recorded as type " +
-			"\"array\" without traversing their elements. Answers \"what's in here\" in a single " +
-			"pass without returning the entries themselves.",
+			"and up to 3 sample values are returned. String samples are capped at 80 runes; object " +
+			"and array samples are replaced with type tokens (e.g. \"object (3 keys)\", \"array[5]\"). " +
+			"Depth-2 paths (e.g. .content.obj.key) are omitted unless they appear in ≥2 entries — " +
+			"single-occurrence depth-2 paths are likely map keys, not schema fields. " +
+			"Answers \"what's in here\" in a single pass without returning the entries themselves.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:         "Describe namespace",
 			ReadOnlyHint:  true,

@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -481,5 +483,161 @@ func TestSearch_EmptyNamespaceReturnsEmpty(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Fatalf("expected 0 hits for empty namespace, got %d", len(hits))
+	}
+}
+
+// ---- fix: compactSample + depth-2 suppression ----
+
+func TestDescribe_Shape_SamplesAreCompacted(t *testing.T) {
+	s := newTestStore(t)
+	longStr := strings.Repeat("x", 100)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": longStr}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"nested": map[string]any{"a": 1, "b": 2}}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tags": []any{"a", "b", "c"}}))
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	byPath := map[string]FieldShape{}
+	for _, fs := range d.Shape {
+		byPath[fs.Path] = fs
+	}
+
+	note := byPath[".content.note"]
+	if len(note.SampleValues) == 0 {
+		t.Fatal("expected sample for .content.note")
+	}
+	sample, ok := note.SampleValues[0].(string)
+	if !ok {
+		t.Fatalf("expected string sample, got %T", note.SampleValues[0])
+	}
+	if len([]rune(sample)) > 84 {
+		t.Errorf("string sample not truncated: len=%d", len([]rune(sample)))
+	}
+	if !strings.HasSuffix(sample, "...") {
+		t.Errorf("expected truncation ellipsis, got %q", sample)
+	}
+
+	nested := byPath[".content.nested"]
+	if len(nested.SampleValues) == 0 {
+		t.Fatal("expected sample for .content.nested")
+	}
+	nestedSample, ok := nested.SampleValues[0].(string)
+	if !ok {
+		t.Fatalf("expected string token for object sample, got %T", nested.SampleValues[0])
+	}
+	if !strings.HasPrefix(nestedSample, "object (") {
+		t.Errorf("expected object token, got %q", nestedSample)
+	}
+
+	tags := byPath[".content.tags"]
+	if len(tags.SampleValues) == 0 {
+		t.Fatal("expected sample for .content.tags")
+	}
+	tagsSample, ok := tags.SampleValues[0].(string)
+	if !ok {
+		t.Fatalf("expected string token for array sample, got %T", tags.SampleValues[0])
+	}
+	if !strings.HasPrefix(tagsSample, "array[") {
+		t.Errorf("expected array token, got %q", tagsSample)
+	}
+
+	if _, ok := byPath[".content.nested.a"]; ok {
+		t.Error(".content.nested.a should be filtered (count=1 at depth-2)")
+	}
+}
+
+func TestDescribe_Shape_MapFieldsSuppressed(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{
+		"individuals": map[string]any{"alice": map[string]any{"age": 30}},
+	}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{
+		"individuals": map[string]any{"bob": map[string]any{"age": 25}},
+	}))
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	byPath := map[string]FieldShape{}
+	for _, fs := range d.Shape {
+		byPath[fs.Path] = fs
+	}
+
+	if _, ok := byPath[".content.individuals"]; !ok {
+		t.Error("expected .content.individuals in shape")
+	}
+	if _, ok := byPath[".content.individuals.alice"]; ok {
+		t.Error(".content.individuals.alice should be suppressed (count=1)")
+	}
+	if _, ok := byPath[".content.individuals.bob"]; ok {
+		t.Error(".content.individuals.bob should be suppressed (count=1)")
+	}
+}
+
+func TestDescribe_FieldMode_SkipsErroringEntries(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"other": "field"}))
+
+	d, err := s.Describe("scratch", `.content | if has("tag") then .tag else error("no tag") end`)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if d.ErroredCount != 1 {
+		t.Errorf("expected errored_count=1, got %d", d.ErroredCount)
+	}
+	if len(d.Distinct) != 2 {
+		t.Fatalf("expected 2 distinct values, got %d", len(d.Distinct))
+	}
+}
+
+func TestDescribe_MalformedLine_CountedNotErrored(t *testing.T) {
+	dir := t.TempDir()
+	s, err := NewStore(dir)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "good"}))
+
+	// Inject a malformed line directly into the JSONL.
+	f, err := os.OpenFile(filepath.Join(dir, "scratch.jsonl"), os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatalf("open jsonl: %v", err)
+	}
+	_, _ = f.WriteString("\nnot valid json\n")
+	f.Close()
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("expected no error on malformed line, got %v", err)
+	}
+	if d.EntryCount != 1 {
+		t.Errorf("expected entry_count=1, got %d", d.EntryCount)
+	}
+	if d.ErroredCount != 1 {
+		t.Errorf("expected errored_count=1, got %d", d.ErroredCount)
+	}
+}
+
+func TestSearch_SnippetCentresOnContent(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "unique-term-here"))
+
+	hits, err := s.Search("unique-term-here", "scratch", false, 0)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if strings.HasPrefix(hits[0].Snippet, `{"id":`) {
+		t.Errorf("snippet should not start with envelope; got %q", hits[0].Snippet)
+	}
+	if !strings.Contains(hits[0].Snippet, "unique-term-here") {
+		t.Errorf("snippet should contain the match; got %q", hits[0].Snippet)
 	}
 }
