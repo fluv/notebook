@@ -46,18 +46,7 @@ type Store struct {
 	dir     string
 	muRoot  sync.Mutex
 	mus     map[string]*sync.Mutex // per-namespace mutex map
-	entropy *monotonicEntropy
-}
-
-type monotonicEntropy struct {
-	mu sync.Mutex
-	e  *ulid.MonotonicEntropy
-}
-
-func (m *monotonicEntropy) Read(p []byte) (int, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.e.Read(p)
+	entropy ulid.MonotonicReader
 }
 
 func NewStore(dir string) (*Store, error) {
@@ -67,7 +56,7 @@ func NewStore(dir string) (*Store, error) {
 	return &Store{
 		dir:     dir,
 		mus:     make(map[string]*sync.Mutex),
-		entropy: &monotonicEntropy{e: ulid.Monotonic(rand.Reader, 0)},
+		entropy: &ulid.LockedMonotonicReader{MonotonicReader: ulid.Monotonic(rand.Reader, 0)},
 	}, nil
 }
 
@@ -147,6 +136,57 @@ func (s *Store) Append(ns string, content any) (Entry, error) {
 		return Entry{}, fmt.Errorf("fsync: %w", err)
 	}
 	return entry, nil
+}
+
+// AppendMany writes multiple entries to the namespace's JSONL file in one
+// lock-acquire / file-open / fsync cycle. All entries land in a single write
+// so they are contiguous on disk and cheaper than N separate Append calls.
+//
+// Contents are marshalled before acquiring the lock so the critical section is
+// as short as possible.
+func (s *Store) AppendMany(ns string, contents []any) ([]Entry, error) {
+	if err := validateNamespace(ns); err != nil {
+		return nil, err
+	}
+	if len(contents) == 0 {
+		return []Entry{}, nil
+	}
+
+	// Pre-marshal all entries before acquiring the lock.
+	entries := make([]Entry, 0, len(contents))
+	var buf []byte
+	for i, content := range contents {
+		now := time.Now().UTC()
+		id, err := s.newID(now)
+		if err != nil {
+			return nil, fmt.Errorf("generate id for entry %d: %w", i, err)
+		}
+		entry := Entry{ID: id, TS: now.Format(time.RFC3339Nano), Content: content}
+		line, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("marshal entry %d: %w", i, err)
+		}
+		buf = append(buf, line...)
+		buf = append(buf, '\n')
+		entries = append(entries, entry)
+	}
+
+	mu := s.lockFor(ns)
+	mu.Lock()
+	defer mu.Unlock()
+
+	f, err := os.OpenFile(s.jsonlPath(ns), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open jsonl: %w", err)
+	}
+	defer f.Close()
+	if _, err := f.Write(buf); err != nil {
+		return nil, fmt.Errorf("write entries: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return nil, fmt.Errorf("fsync: %w", err)
+	}
+	return entries, nil
 }
 
 // Delete tombstones an ID in the given namespace. Idempotent: tombstoning an

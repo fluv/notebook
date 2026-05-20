@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -12,9 +13,13 @@ import (
 // marshalled at handler time. `any` is used rather than json.RawMessage
 // because the SDK's schema inferer treats RawMessage as []byte and emits
 // type: [null, array], rejecting objects at the protocol layer.
+//
+// Entries is an optional bulk field: when present, content is ignored and all
+// values are appended in a single file-open / fsync cycle.
 type appendArgs struct {
 	Namespace string `json:"namespace"`
-	Content   any    `json:"content"`
+	Content   any    `json:"content,omitempty"`
+	Entries   []any  `json:"entries,omitempty"`
 }
 
 // appendInputSchema overrides the SDK's auto-generated schema. The inferer
@@ -36,16 +41,24 @@ var appendInputSchema = &jsonschema.Schema{
 		},
 		"content": {
 			Types:       []string{"object", "array", "string", "number", "boolean", "null"},
-			Description: "any JSON value — object/array/string/number/boolean/null. Send the value structurally; do not pre-serialize.",
+			Description: "single entry value (any JSON type). Provide content OR entries, not both.",
+		},
+		"entries": {
+			Type:        "array",
+			Description: "bulk: array of content values appended in one call, one ULID per element. Provide entries OR content, not both.",
+			Items: &jsonschema.Schema{
+				Types: []string{"object", "array", "string", "number", "boolean", "null"},
+			},
 		},
 	},
-	Required: []string{"namespace", "content"},
+	Required: []string{"namespace"},
 }
 
-// appendResult echoes the stored entry in full. Callers can confirm what
-// landed on disk without a follow-up read.
+// appendResult echoes what was stored so callers can confirm without a
+// follow-up read. Single-append sets entry; bulk-append sets entries.
 type appendResult struct {
-	Entry Entry `json:"entry" jsonschema:"the entry that was just stored, including id, ts, and content"`
+	Entry   *Entry  `json:"entry,omitempty" jsonschema:"set on single-append (content field)"`
+	Entries []Entry `json:"entries,omitempty" jsonschema:"set on bulk-append (entries field), one element per input"`
 }
 
 type getArgs struct {
@@ -161,9 +174,12 @@ func registerTools(server *mcp.Server, store *Store) {
 
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "append",
-		Description: "Append a content value to a namespace. Content may be any JSON value (string, " +
-			"number, object, array, null). Returns the stored entry in full so the caller can " +
-			"confirm what landed without a follow-up read. The namespace is created on first append.",
+		Description: "Append one or more content values to a namespace. Each value may be any JSON " +
+			"type (string, number, object, array, null). " +
+			"Single-entry: pass `content`; returns `{entry: {id, ts, content}}`. " +
+			"Bulk: pass `entries` (array of values); all are written in one file-open/fsync cycle " +
+			"and `{entries: [{id, ts, content}, ...]}` is returned. Prefer bulk over repeated " +
+			"single calls when appending N items. The namespace is created on first append.",
 		InputSchema: appendInputSchema,
 		Annotations: &mcp.ToolAnnotations{
 			Title: "Append entry",
@@ -175,12 +191,28 @@ func registerTools(server *mcp.Server, store *Store) {
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args appendArgs) (*mcp.CallToolResult, appendResult, error) {
 		start := time.Now()
+		hasBulk := args.Entries != nil
+		hasSingle := args.Content != nil
+		if hasBulk && hasSingle {
+			return nil, appendResult{}, errors.New("provide content OR entries, not both")
+		}
+		if !hasBulk && !hasSingle {
+			return nil, appendResult{}, errors.New("provide either content (single value) or entries (array of values)")
+		}
+		if hasBulk {
+			entries, err := store.AppendMany(args.Namespace, args.Entries)
+			recordCall("append", start, err)
+			if err != nil {
+				return nil, appendResult{}, err
+			}
+			return nil, appendResult{Entries: entries}, nil
+		}
 		entry, err := store.Append(args.Namespace, args.Content)
 		recordCall("append", start, err)
 		if err != nil {
 			return nil, appendResult{}, err
 		}
-		return nil, appendResult{Entry: entry}, nil
+		return nil, appendResult{Entry: &entry}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
