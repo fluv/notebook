@@ -401,7 +401,13 @@ func recordPath(acc map[string]*pathAcc, path string, v any) {
 	}
 	a.count++
 	a.types[jsonType(v)] = struct{}{}
-	key, _ := json.Marshal(v)
+	// v always originates from json.Unmarshal and is therefore always JSON-safe;
+	// this branch cannot fire in practice, but skip distinct tracking defensively
+	// to avoid silent bucket corruption on unexpected input.
+	key, kerr := json.Marshal(v)
+	if kerr != nil {
+		return
+	}
 	ks := string(key)
 	if _, seen := a.distinct[ks]; !seen {
 		a.distinct[ks] = struct{}{}
