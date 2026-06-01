@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/google/jsonschema-go/jsonschema"
@@ -137,7 +138,7 @@ func registerTools(server *mcp.Server, store *Store) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, _ listNamespacesArgs) (*mcp.CallToolResult, listNamespacesResult, error) {
 		start := time.Now()
 		ns, err := store.ListNamespaces()
-		recordCall("list_namespaces", start, err)
+		observe("list_namespaces", start, err, slog.Int("namespaces", len(ns)))
 		if err != nil {
 			return nil, listNamespacesResult{}, err
 		}
@@ -165,7 +166,10 @@ func registerTools(server *mcp.Server, store *Store) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args describeArgs) (*mcp.CallToolResult, describeResult, error) {
 		start := time.Now()
 		d, err := store.Describe(args.Namespace, args.Field)
-		recordCall("describe_namespace", start, err)
+		observe("describe_namespace", start, err,
+			slog.String("namespace", args.Namespace),
+			slog.String("field", args.Field),
+		)
 		if err != nil {
 			return nil, describeResult{}, err
 		}
@@ -201,14 +205,22 @@ func registerTools(server *mcp.Server, store *Store) {
 		}
 		if hasBulk {
 			entries, err := store.AppendMany(args.Namespace, args.Entries)
-			recordCall("append", start, err)
+			observe("append", start, err,
+				slog.String("namespace", args.Namespace),
+				slog.String("mode", "bulk"),
+				slog.Int("count", len(args.Entries)),
+			)
 			if err != nil {
 				return nil, appendResult{}, err
 			}
 			return nil, appendResult{Entries: entries}, nil
 		}
 		entry, err := store.Append(args.Namespace, args.Content)
-		recordCall("append", start, err)
+		observe("append", start, err,
+			slog.String("namespace", args.Namespace),
+			slog.String("mode", "single"),
+			slog.Int("count", 1),
+		)
 		if err != nil {
 			return nil, appendResult{}, err
 		}
@@ -229,7 +241,12 @@ func registerTools(server *mcp.Server, store *Store) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args getArgs) (*mcp.CallToolResult, getResult, error) {
 		start := time.Now()
 		entries, err := store.Get(args.Namespace, args.Jq, args.Last)
-		recordCall("get", start, err)
+		observe("get", start, err,
+			slog.String("namespace", args.Namespace),
+			slog.Bool("has_jq", args.Jq != ""),
+			slog.Int("last", args.Last),
+			slog.Int("returned", len(entries)),
+		)
 		if err != nil {
 			return nil, getResult{}, err
 		}
@@ -250,7 +267,10 @@ func registerTools(server *mcp.Server, store *Store) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args deleteArgs) (*mcp.CallToolResult, deleteResult, error) {
 		start := time.Now()
 		err := store.Delete(args.Namespace, args.ID)
-		recordCall("delete", start, err)
+		observe("delete", start, err,
+			slog.String("namespace", args.Namespace),
+			slog.String("id", args.ID),
+		)
 		if err != nil {
 			return nil, deleteResult{}, err
 		}
@@ -272,7 +292,15 @@ func registerTools(server *mcp.Server, store *Store) {
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, searchResult, error) {
 		start := time.Now()
 		hits, err := store.Search(args.Query, args.Namespace, args.Regex, args.Limit)
-		recordCall("search", start, err)
+		searchScope := args.Namespace
+		if searchScope == "" {
+			searchScope = "*"
+		}
+		observe("search", start, err,
+			slog.String("namespace", searchScope),
+			slog.Bool("regex", args.Regex),
+			slog.Int("hits", len(hits)),
+		)
 		if err != nil {
 			return nil, searchResult{}, err
 		}
