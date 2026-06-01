@@ -58,16 +58,39 @@ model is preserved.
 Configuration
 -------------
 
-| Flag      | Env       | Default | Meaning                          |
-|-----------|-----------|---------|----------------------------------|
-| `-port`   | `PORT`    | `8080`  | HTTP listen port                 |
-| `-data`   | `DATA_DIR`| `/data` | Directory holding namespace files|
+| Flag      | Env        | Default | Meaning                           |
+|-----------|------------|---------|-----------------------------------|
+| `-port`   | `PORT`     | `8080`  | HTTP listen port                  |
+| `-data`   | `DATA_DIR` | `/data` | Directory holding namespace files |
+|           | `LOG_LEVEL`| `info`  | Log verbosity: `debug`/`info`/`warn`/`error` |
+
+Logging
+-------
+
+Logs are structured JSON on stdout (picked up by the kubelet → Loki). Two
+layers:
+
+- **HTTP access log** — one line per request (method, path, remote, status,
+  bytes, duration). This is the transport/connectivity view: it captures
+  requests that never reach a tool handler (404s, malformed bodies). Probe
+  and scrape traffic (`/healthz`, `/metrics`) is logged at `debug` to avoid
+  drowning the steady state — set `LOG_LEVEL=debug` to see it.
+- **Tool-call log** (`msg: "tool call"`) — one line per MCP tool invocation
+  with the tool name, duration, outcome, and tool-specific context
+  (namespace, id, counts). Successes log at `info`; failures log at `error`
+  with the underlying message. Note that tool errors are returned to the
+  client as HTTP 200 with an error body, so the access log shows `200` — the
+  tool-call log is where failures actually surface.
+
+Aggregate usage and latency are also exported as Prometheus metrics
+(`notebook_tool_calls_total`, `notebook_tool_duration_seconds`).
 
 Endpoints
 ---------
 
 - `POST /mcp` — MCP Streamable HTTP transport (stateless, JSON responses).
 - `GET /healthz` — liveness probe.
+- `GET /metrics` — Prometheus metrics.
 
 Deployment lives in [fluv/kube](https://github.com/fluv/kube) under
 `claude-notebook/`.

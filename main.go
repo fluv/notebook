@@ -7,7 +7,7 @@ package main
 
 import (
 	"flag"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -18,7 +18,7 @@ import (
 
 const (
 	serverName    = "notebook"
-	serverVersion = "0.3.1"
+	serverVersion = "0.4.0"
 	defaultPort   = 8080
 	defaultDir    = "/data"
 )
@@ -44,9 +44,14 @@ func main() {
 	dir := flag.String("data", envStr("DATA_DIR", defaultDir), "Directory holding namespace JSONL files")
 	flag.Parse()
 
+	// Configure logging before anything that might fail, so the first failure
+	// mode (store init) is reported through the structured logger too.
+	setupLogging()
+
 	store, err := NewStore(*dir)
 	if err != nil {
-		log.Fatalf("store init: %v", err)
+		slog.Error("store init failed", slog.String("error", err.Error()), slog.String("data", *dir))
+		os.Exit(1)
 	}
 
 	// NewStreamableHTTPHandler accepts a factory so a fresh Server instance
@@ -77,11 +82,16 @@ func main() {
 	addr := ":" + strconv.Itoa(*port)
 	srv := &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           accessLog(mux),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-	log.Printf("notebook v%s listening on %s, data=%s", serverVersion, addr, *dir)
+	slog.Info("notebook listening",
+		slog.String("version", serverVersion),
+		slog.String("addr", addr),
+		slog.String("data", *dir),
+	)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("listen: %v", err)
+		slog.Error("listen failed", slog.String("error", err.Error()))
+		os.Exit(1)
 	}
 }
