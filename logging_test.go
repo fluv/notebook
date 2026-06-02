@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -60,4 +61,78 @@ func TestAccessLogCapturesStatus(t *testing.T) {
 	if rr.Code != http.StatusBadGateway {
 		t.Errorf("downstream status = %d, want %d", rr.Code, http.StatusBadGateway)
 	}
+}
+
+// A POST /mcp that returns Mcp-Session-Id in the response must emit a
+// "session created" log. A POST without the header must not.
+func TestSessionCreatedLog(t *testing.T) {
+	const sid = "TESTSESSIONID"
+
+	withSession := accessLog(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Mcp-Session-Id", sid)
+		w.WriteHeader(http.StatusOK)
+	}))
+	withoutSession := accessLog(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var logged []slog.Record
+	logger := slog.New(recordHandler{&logged})
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(slog.Default()) })
+
+	rr := httptest.NewRecorder()
+	withSession.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if !containsMsg(logged, "session created") {
+		t.Error("expected 'session created' log, got none")
+	}
+
+	logged = logged[:0]
+	rr = httptest.NewRecorder()
+	withoutSession.ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/mcp", nil))
+	if containsMsg(logged, "session created") {
+		t.Error("unexpected 'session created' log on response without session header")
+	}
+}
+
+// A DELETE /mcp that carries Mcp-Session-Id in the request and returns 200
+// must emit a "session terminated" log.
+func TestSessionTerminatedLog(t *testing.T) {
+	const sid = "TESTSESSIONID"
+
+	h := accessLog(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+
+	var logged []slog.Record
+	logger := slog.New(recordHandler{&logged})
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(slog.Default()) })
+
+	req := httptest.NewRequest(http.MethodDelete, "/mcp", nil)
+	req.Header.Set("Mcp-Session-Id", sid)
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if !containsMsg(logged, "session terminated") {
+		t.Error("expected 'session terminated' log, got none")
+	}
+}
+
+// recordHandler is a minimal slog.Handler that collects records for test assertions.
+type recordHandler struct{ records *[]slog.Record }
+
+func (h recordHandler) Enabled(_ context.Context, _ slog.Level) bool { return true }
+func (h recordHandler) Handle(_ context.Context, r slog.Record) error {
+	*h.records = append(*h.records, r)
+	return nil
+}
+func (h recordHandler) WithAttrs(_ []slog.Attr) slog.Handler { return h }
+func (h recordHandler) WithGroup(_ string) slog.Handler      { return h }
+
+func containsMsg(records []slog.Record, msg string) bool {
+	for _, r := range records {
+		if r.Message == msg {
+			return true
+		}
+	}
+	return false
 }

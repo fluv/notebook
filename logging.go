@@ -97,5 +97,30 @@ func accessLog(next http.Handler) http.Handler {
 			slog.Int("bytes", rec.bytes),
 			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
 		)
+
+		// Log session lifecycle events so idle intervals are recoverable.
+		// The SDK sets Mcp-Session-Id in the response on a successful
+		// initialize; client-initiated teardown sends it in the request.
+		switch r.Method {
+		case http.MethodPost:
+			if rec.status == http.StatusOK {
+				if sid := rec.Header().Get("Mcp-Session-Id"); sid != "" {
+					slog.Info("session created",
+						slog.String("session_id", sid),
+						slog.String("remote", r.RemoteAddr),
+					)
+				}
+			}
+		case http.MethodDelete:
+			if rec.status == http.StatusOK {
+				if sid := r.Header.Get("Mcp-Session-Id"); sid != "" {
+					slog.Info("session terminated",
+						slog.String("session_id", sid),
+						slog.String("remote", r.RemoteAddr),
+						slog.String("cause", "client"),
+					)
+				}
+			}
+		}
 	})
 }
