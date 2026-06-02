@@ -18,7 +18,7 @@ import (
 
 const (
 	serverName    = "notebook"
-	serverVersion = "0.5.0"
+	serverVersion = "0.5.1"
 	defaultPort   = 8080
 	defaultDir    = "/data"
 )
@@ -67,7 +67,7 @@ func main() {
 
 	mcpHandler := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return server },
-		&mcp.StreamableHTTPOptions{JSONResponse: true},
+		&mcp.StreamableHTTPOptions{JSONResponse: true, Stateless: true},
 	)
 
 	mux := http.NewServeMux()
