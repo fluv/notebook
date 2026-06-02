@@ -97,7 +97,7 @@ type describeResult struct {
 }
 
 type searchArgs struct {
-	Query     string `json:"query" jsonschema:"substring or regex to search for in raw entry JSON"`
+	Query     string `json:"query" jsonschema:"literal substring (verbatim, not keyword-decomposed) or Go regex; for multi-keyword OR use regex mode with alternation: shopping|recipe|meal"`
 	Namespace string `json:"namespace,omitempty" jsonschema:"namespace to search; omit to search all namespaces"`
 	Regex     bool   `json:"regex,omitempty" jsonschema:"when true, treat query as a Go regular expression"`
 	Limit     int    `json:"limit,omitempty" jsonschema:"maximum number of hits to return; defaults to 20"`
@@ -280,7 +280,8 @@ func registerTools(server *mcp.Server, store *Store) {
 	mcp.AddTool(server, &mcp.Tool{
 		Name: "search",
 		Description: "Scan one or all namespaces for entries whose raw JSON contains a match. " +
-			"Matching is substring by default; set `regex` to use a Go regular expression. " +
+			"Matching is substring by default — the query is matched verbatim, not decomposed into keywords. " +
+			"For multi-keyword OR searches, set `regex: true` and use alternation: `shopping|recipe|meal`. " +
 			"Tombstoned entries are skipped. Returns up to `limit` hits (default 20), each " +
 			"with namespace, id, ts, and a ~120-character snippet centred on the first match. " +
 			"The search runs against raw JSONL so it also matches on id and ts fields.",
