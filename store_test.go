@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -26,13 +27,15 @@ func mustJSON(t *testing.T, v any) json.RawMessage {
 	return b
 }
 
+func boolp(b bool) *bool { return &b }
+
 func TestAppendAndGet_RoundTrip(t *testing.T) {
 	s := newTestStore(t)
-	first, err := s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}))
+	first, err := s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}), false)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
-	second, err := s.Append("scratch", mustJSON(t, "a free-text note"))
+	second, err := s.Append("scratch", mustJSON(t, "a free-text note"), false)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
@@ -43,7 +46,7 @@ func TestAppendAndGet_RoundTrip(t *testing.T) {
 		t.Fatalf("expected distinct IDs")
 	}
 
-	results, err := s.Get("scratch", "", 0)
+	results, err := s.Get("scratch", "", 0, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -55,7 +58,7 @@ func TestAppendAndGet_RoundTrip(t *testing.T) {
 func TestAppend_RejectsInvalidNamespace(t *testing.T) {
 	s := newTestStore(t)
 	for _, bad := range []string{"", "with/slash", "with.dot", "-leading-dash", "with space", strings.Repeat("a", 65)} {
-		if _, err := s.Append(bad, mustJSON(t, "x")); err == nil {
+		if _, err := s.Append(bad, mustJSON(t, "x"), false); err == nil {
 			t.Errorf("expected error for namespace %q", bad)
 		}
 	}
@@ -63,7 +66,7 @@ func TestAppend_RejectsInvalidNamespace(t *testing.T) {
 
 func TestAppend_RejectsInvalidJSON(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Append("ok", json.RawMessage("{not json")); err == nil {
+	if _, err := s.Append("ok", json.RawMessage("{not json"), false); err == nil {
 		t.Error("expected error for invalid JSON content")
 	}
 }
@@ -75,7 +78,7 @@ func TestAppendMany_RoundTrip(t *testing.T) {
 		"a free-text note",
 		42.0,
 	}
-	entries, err := s.AppendMany("scratch", contents)
+	entries, err := s.AppendMany("scratch", contents, false)
 	if err != nil {
 		t.Fatalf("AppendMany: %v", err)
 	}
@@ -93,7 +96,7 @@ func TestAppendMany_RoundTrip(t *testing.T) {
 		t.Error("expected all IDs to be distinct")
 	}
 
-	results, err := s.Get("scratch", "", 0)
+	results, err := s.Get("scratch", "", 0, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -104,14 +107,14 @@ func TestAppendMany_RoundTrip(t *testing.T) {
 
 func TestAppendMany_Empty(t *testing.T) {
 	s := newTestStore(t)
-	entries, err := s.AppendMany("scratch", nil)
+	entries, err := s.AppendMany("scratch", nil, false)
 	if err != nil {
 		t.Fatalf("AppendMany(nil): %v", err)
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected 0 entries, got %d", len(entries))
 	}
-	entries, err = s.AppendMany("scratch", []any{})
+	entries, err = s.AppendMany("scratch", []any{}, false)
 	if err != nil {
 		t.Fatalf("AppendMany([]): %v", err)
 	}
@@ -126,7 +129,7 @@ func TestAppendMany_ULIDsAreMonotonic(t *testing.T) {
 	for i := range contents {
 		contents[i] = i
 	}
-	entries, err := s.AppendMany("scratch", contents)
+	entries, err := s.AppendMany("scratch", contents, false)
 	if err != nil {
 		t.Fatalf("AppendMany: %v", err)
 	}
@@ -140,21 +143,21 @@ func TestAppendMany_ULIDsAreMonotonic(t *testing.T) {
 
 func TestAppendMany_RejectsInvalidNamespace(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.AppendMany("with/slash", []any{"x"}); err == nil {
+	if _, err := s.AppendMany("with/slash", []any{"x"}, false); err == nil {
 		t.Error("expected error for invalid namespace")
 	}
 }
 
 func TestDelete_TombstoneHidesEntry(t *testing.T) {
 	s := newTestStore(t)
-	entry, err := s.Append("scratch", mustJSON(t, "doomed"))
+	entry, err := s.Append("scratch", mustJSON(t, "doomed"), false)
 	if err != nil {
 		t.Fatalf("append: %v", err)
 	}
 	if err := s.Delete("scratch", entry.ID); err != nil {
 		t.Fatalf("delete: %v", err)
 	}
-	results, err := s.Get("scratch", "", 0)
+	results, err := s.Get("scratch", "", 0, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -165,7 +168,7 @@ func TestDelete_TombstoneHidesEntry(t *testing.T) {
 
 func TestDelete_IsIdempotent(t *testing.T) {
 	s := newTestStore(t)
-	entry, _ := s.Append("scratch", mustJSON(t, "x"))
+	entry, _ := s.Append("scratch", mustJSON(t, "x"), false)
 	if err := s.Delete("scratch", entry.ID); err != nil {
 		t.Fatalf("delete 1: %v", err)
 	}
@@ -183,11 +186,11 @@ func TestDelete_RejectsInvalidID(t *testing.T) {
 
 func TestGet_JqFilterNestedFieldMatch(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter", "shot": 22.0}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 19.0}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter", "shot": 22.0}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 19.0}), false)
 
-	results, err := s.Get("scratch", `select(.content.tag == "espresso")`, 0)
+	results, err := s.Get("scratch", `select(.content.tag == "espresso")`, 0, nil)
 	if err != nil {
 		t.Fatalf("get with jq: %v", err)
 	}
@@ -199,9 +202,9 @@ func TestGet_JqFilterNestedFieldMatch(t *testing.T) {
 func TestGet_LastTakesFinalN(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 5; i++ {
-		_, _ = s.Append("scratch", mustJSON(t, i))
+		_, _ = s.Append("scratch", mustJSON(t, i), false)
 	}
-	results, err := s.Get("scratch", "", 2)
+	results, err := s.Get("scratch", "", 2, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -220,9 +223,9 @@ func TestGet_JqRunsBeforeLast(t *testing.T) {
 	s := newTestStore(t)
 	for i := 0; i < 10; i++ {
 		even := i%2 == 0
-		_, _ = s.Append("scratch", mustJSON(t, map[string]any{"i": i, "even": even}))
+		_, _ = s.Append("scratch", mustJSON(t, map[string]any{"i": i, "even": even}), false)
 	}
-	results, err := s.Get("scratch", `select(.content.even)`, 2)
+	results, err := s.Get("scratch", `select(.content.even)`, 2, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -233,7 +236,7 @@ func TestGet_JqRunsBeforeLast(t *testing.T) {
 
 func TestGet_EmptyNamespaceReturnsEmpty(t *testing.T) {
 	s := newTestStore(t)
-	results, err := s.Get("never-touched", "", 0)
+	results, err := s.Get("never-touched", "", 0, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -244,17 +247,17 @@ func TestGet_EmptyNamespaceReturnsEmpty(t *testing.T) {
 
 func TestGet_InvalidJqReturnsError(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, 1))
-	if _, err := s.Get("scratch", "(((not jq", 0); err == nil {
+	_, _ = s.Append("scratch", mustJSON(t, 1), false)
+	if _, err := s.Get("scratch", "(((not jq", 0, nil); err == nil {
 		t.Error("expected parse error")
 	}
 }
 
 func TestListNamespaces_ReturnsSummaries(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("alpha", mustJSON(t, 1))
-	_, _ = s.Append("alpha", mustJSON(t, 2))
-	_, _ = s.Append("beta", mustJSON(t, 3))
+	_, _ = s.Append("alpha", mustJSON(t, 1), false)
+	_, _ = s.Append("alpha", mustJSON(t, 2), false)
+	_, _ = s.Append("beta", mustJSON(t, 3), false)
 	ns, err := s.ListNamespaces()
 	if err != nil {
 		t.Fatalf("list: %v", err)
@@ -276,9 +279,9 @@ func TestListNamespaces_ReturnsSummaries(t *testing.T) {
 
 func TestDescribe_BasicCounts(t *testing.T) {
 	s := newTestStore(t)
-	e1, _ := s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}))
+	e1, _ := s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}), false)
 	_ = s.Delete("scratch", e1.ID)
 
 	d, err := s.Describe("scratch", "")
@@ -301,10 +304,10 @@ func TestDescribe_BasicCounts(t *testing.T) {
 
 func TestDescribe_DistinctValuesOnField(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}), false)
 
 	d, err := s.Describe("scratch", ".content.tag")
 	if err != nil {
@@ -339,13 +342,13 @@ func TestPersistence_AcrossStoreReopen(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore 1: %v", err)
 	}
-	entry, _ := s1.Append("scratch", mustJSON(t, "durable"))
+	entry, _ := s1.Append("scratch", mustJSON(t, "durable"), false)
 
 	s2, err := NewStore(dir)
 	if err != nil {
 		t.Fatalf("NewStore 2: %v", err)
 	}
-	results, err := s2.Get("scratch", "", 0)
+	results, err := s2.Get("scratch", "", 0, nil)
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
@@ -362,8 +365,8 @@ func TestPersistence_AcrossStoreReopen(t *testing.T) {
 
 func TestDescribe_Shape_InfersSchema(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter", "shot": 22.0}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso", "shot": 18.0}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter", "shot": 22.0}), false)
 
 	d, err := s.Describe("scratch", "")
 	if err != nil {
@@ -402,9 +405,9 @@ func TestDescribe_Shape_InfersSchema(t *testing.T) {
 
 func TestDescribe_Shape_MixedTypes(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"val": "hello"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"val": 42.0}))
-	_, _ = s.Append("scratch", mustJSON(t, "just a string")) // non-object content
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"val": "hello"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"val": 42.0}), false)
+	_, _ = s.Append("scratch", mustJSON(t, "just a string"), false) // non-object content
 
 	d, err := s.Describe("scratch", "")
 	if err != nil {
@@ -435,7 +438,7 @@ func TestDescribe_Shape_MixedTypes(t *testing.T) {
 
 func TestDescribe_Shape_NotSetWhenFieldGiven(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "x"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "x"}), false)
 
 	d, err := s.Describe("scratch", ".content.tag")
 	if err != nil {
@@ -453,10 +456,10 @@ func TestDescribe_Shape_NotSetWhenFieldGiven(t *testing.T) {
 
 func TestSearch_SubstringHit(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "best espresso"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "filter coffee"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "best espresso"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "filter coffee"}), false)
 
-	hits, err := s.Search("espresso", "scratch", false, 0)
+	hits, err := s.Search("espresso", "scratch", false, 0, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -473,11 +476,11 @@ func TestSearch_SubstringHit(t *testing.T) {
 
 func TestSearch_RegexHit(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, "shot 18g"))
-	_, _ = s.Append("scratch", mustJSON(t, "shot 22g"))
-	_, _ = s.Append("scratch", mustJSON(t, "no match here"))
+	_, _ = s.Append("scratch", mustJSON(t, "shot 18g"), false)
+	_, _ = s.Append("scratch", mustJSON(t, "shot 22g"), false)
+	_, _ = s.Append("scratch", mustJSON(t, "no match here"), false)
 
-	hits, err := s.Search(`shot \d+g`, "scratch", true, 0)
+	hits, err := s.Search(`shot \d+g`, "scratch", true, 0, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -488,11 +491,11 @@ func TestSearch_RegexHit(t *testing.T) {
 
 func TestSearch_SkipsTombstoned(t *testing.T) {
 	s := newTestStore(t)
-	e, _ := s.Append("scratch", mustJSON(t, "doomed espresso"))
-	_, _ = s.Append("scratch", mustJSON(t, "survivor"))
+	e, _ := s.Append("scratch", mustJSON(t, "doomed espresso"), false)
+	_, _ = s.Append("scratch", mustJSON(t, "survivor"), false)
 	_ = s.Delete("scratch", e.ID)
 
-	hits, err := s.Search("espresso", "scratch", false, 0)
+	hits, err := s.Search("espresso", "scratch", false, 0, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -503,11 +506,11 @@ func TestSearch_SkipsTombstoned(t *testing.T) {
 
 func TestSearch_AllNamespaces(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("alpha", mustJSON(t, "espresso here"))
-	_, _ = s.Append("beta", mustJSON(t, "espresso there"))
-	_, _ = s.Append("gamma", mustJSON(t, "no match"))
+	_, _ = s.Append("alpha", mustJSON(t, "espresso here"), false)
+	_, _ = s.Append("beta", mustJSON(t, "espresso there"), false)
+	_, _ = s.Append("gamma", mustJSON(t, "no match"), false)
 
-	hits, err := s.Search("espresso", "", false, 0)
+	hits, err := s.Search("espresso", "", false, 0, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -526,9 +529,9 @@ func TestSearch_AllNamespaces(t *testing.T) {
 func TestSearch_LimitCaps(t *testing.T) {
 	s := newTestStore(t)
 	for range 5 {
-		_, _ = s.Append("scratch", mustJSON(t, "entry"))
+		_, _ = s.Append("scratch", mustJSON(t, "entry"), false)
 	}
-	hits, err := s.Search("entry", "scratch", false, 3)
+	hits, err := s.Search("entry", "scratch", false, 3, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -539,22 +542,22 @@ func TestSearch_LimitCaps(t *testing.T) {
 
 func TestSearch_EmptyQueryError(t *testing.T) {
 	s := newTestStore(t)
-	if _, err := s.Search("", "scratch", false, 0); err == nil {
+	if _, err := s.Search("", "scratch", false, 0, nil); err == nil {
 		t.Error("expected error for empty query")
 	}
 }
 
 func TestSearch_InvalidRegexError(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, "x"))
-	if _, err := s.Search(`[invalid`, "scratch", true, 0); err == nil {
+	_, _ = s.Append("scratch", mustJSON(t, "x"), false)
+	if _, err := s.Search(`[invalid`, "scratch", true, 0, nil); err == nil {
 		t.Error("expected error for invalid regex")
 	}
 }
 
 func TestSearch_EmptyNamespaceReturnsEmpty(t *testing.T) {
 	s := newTestStore(t)
-	hits, err := s.Search("anything", "never-touched", false, 0)
+	hits, err := s.Search("anything", "never-touched", false, 0, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -568,9 +571,9 @@ func TestSearch_EmptyNamespaceReturnsEmpty(t *testing.T) {
 func TestDescribe_Shape_SamplesAreCompacted(t *testing.T) {
 	s := newTestStore(t)
 	longStr := strings.Repeat("x", 100)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": longStr}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"nested": map[string]any{"a": 1, "b": 2}}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tags": []any{"a", "b", "c"}}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": longStr}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"nested": map[string]any{"a": 1, "b": 2}}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tags": []any{"a", "b", "c"}}), false)
 
 	d, err := s.Describe("scratch", "")
 	if err != nil {
@@ -629,10 +632,10 @@ func TestDescribe_Shape_MapFieldsSuppressed(t *testing.T) {
 	s := newTestStore(t)
 	_, _ = s.Append("scratch", mustJSON(t, map[string]any{
 		"individuals": map[string]any{"alice": map[string]any{"age": 30}},
-	}))
+	}), false)
 	_, _ = s.Append("scratch", mustJSON(t, map[string]any{
 		"individuals": map[string]any{"bob": map[string]any{"age": 25}},
-	}))
+	}), false)
 
 	d, err := s.Describe("scratch", "")
 	if err != nil {
@@ -656,9 +659,9 @@ func TestDescribe_Shape_MapFieldsSuppressed(t *testing.T) {
 
 func TestDescribe_FieldMode_SkipsErroringEntries(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}))
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"other": "field"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "espresso"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}), false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"other": "field"}), false)
 
 	d, err := s.Describe("scratch", `.content | if has("tag") then .tag else error("no tag") end`)
 	if err != nil {
@@ -678,7 +681,7 @@ func TestDescribe_MalformedLine_CountedNotErrored(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "good"}))
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "good"}), false)
 
 	// Inject a malformed line directly into the JSONL.
 	f, err := os.OpenFile(filepath.Join(dir, "scratch.jsonl"), os.O_APPEND|os.O_WRONLY, 0o644)
@@ -702,9 +705,9 @@ func TestDescribe_MalformedLine_CountedNotErrored(t *testing.T) {
 
 func TestSearch_SnippetCentresOnContent(t *testing.T) {
 	s := newTestStore(t)
-	_, _ = s.Append("scratch", mustJSON(t, "unique-term-here"))
+	_, _ = s.Append("scratch", mustJSON(t, "unique-term-here"), false)
 
-	hits, err := s.Search("unique-term-here", "scratch", false, 0)
+	hits, err := s.Search("unique-term-here", "scratch", false, 0, nil)
 	if err != nil {
 		t.Fatalf("search: %v", err)
 	}
@@ -716,5 +719,266 @@ func TestSearch_SnippetCentresOnContent(t *testing.T) {
 	}
 	if !strings.Contains(hits[0].Snippet, "unique-term-here") {
 		t.Errorf("snippet should contain the match; got %q", hits[0].Snippet)
+	}
+}
+
+// ---- timestamp truncation tests ----
+
+func TestAppend_TSTruncatedToSeconds(t *testing.T) {
+	s := newTestStore(t)
+	e, err := s.Append("scratch", mustJSON(t, "x"), false)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	// RFC3339 (second precision) parses cleanly and has no sub-second component.
+	parsed, err := time.Parse(time.RFC3339, e.TS)
+	if err != nil {
+		t.Fatalf("ts not RFC3339: %q, err: %v", e.TS, err)
+	}
+	if parsed.Nanosecond() != 0 {
+		t.Errorf("expected second precision, got nanosecond=%d in %q", parsed.Nanosecond(), e.TS)
+	}
+	// Verify on-disk remains full precision.
+	results, _ := s.Get("scratch", "", 0, nil)
+	got := results[0].(Entry)
+	if got.TS != e.TS {
+		// both should be RFC3339; make sure the returned value is also truncated
+		t.Errorf("Get returned ts %q, Append returned %q; expected same", got.TS, e.TS)
+	}
+}
+
+func TestGet_TSTruncatedToSeconds(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "x"), false)
+
+	results, err := s.Get("scratch", "", 0, nil)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	e := results[0].(Entry)
+	if _, err := time.Parse(time.RFC3339, e.TS); err != nil {
+		t.Errorf("ts not RFC3339: %q, err: %v", e.TS, err)
+	}
+	if strings.Contains(e.TS, ".") {
+		t.Errorf("ts has sub-second component: %q", e.TS)
+	}
+}
+
+func TestSearch_TSTruncatedToSeconds(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "findme"), false)
+
+	hits, err := s.Search("findme", "scratch", false, 0, nil)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit, got %d", len(hits))
+	}
+	if _, err := time.Parse(time.RFC3339, hits[0].TS); err != nil {
+		t.Errorf("hit ts not RFC3339: %q", hits[0].TS)
+	}
+	if strings.Contains(hits[0].TS, ".") {
+		t.Errorf("hit ts has sub-second component: %q", hits[0].TS)
+	}
+}
+
+// ---- sensitive entry tests ----
+
+func TestSensitive_HiddenWhenDefaultExclude(t *testing.T) {
+	t.Setenv("NOTEBOOK_SENSITIVE_DEFAULT", "exclude")
+	s := newTestStore(t)
+	hidden, _ := s.Append("scratch", mustJSON(t, "secret"), true)
+	visible, _ := s.Append("scratch", mustJSON(t, "public"), false)
+
+	results, err := s.Get("scratch", "", 0, nil) // nil = use default = exclude
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 visible entry, got %d", len(results))
+	}
+	got := results[0].(Entry)
+	if got.ID == hidden.ID {
+		t.Error("sensitive entry should be hidden by default when NOTEBOOK_SENSITIVE_DEFAULT=exclude")
+	}
+	if got.ID != visible.ID {
+		t.Error("public entry should be visible")
+	}
+}
+
+func TestSensitive_IncludeOverride(t *testing.T) {
+	t.Setenv("NOTEBOOK_SENSITIVE_DEFAULT", "exclude")
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "secret"), true)
+	_, _ = s.Append("scratch", mustJSON(t, "public"), false)
+
+	results, err := s.Get("scratch", "", 0, boolp(true))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("expected 2 entries with include_sensitive=true, got %d", len(results))
+	}
+}
+
+func TestSensitive_ExcludeOverride(t *testing.T) {
+	// Default is include; explicit false should exclude.
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "secret"), true)
+	_, _ = s.Append("scratch", mustJSON(t, "public"), false)
+
+	results, err := s.Get("scratch", "", 0, boolp(false))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result with include_sensitive=false, got %d", len(results))
+	}
+	got := results[0].(Entry)
+	if got.Content.(string) != "public" {
+		t.Errorf("expected public entry, got %v", got.Content)
+	}
+}
+
+func TestSensitive_IncludedByDefaultWithoutEnvVar(t *testing.T) {
+	// No env var → default is include, so sensitive entries are visible.
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "secret"), true)
+
+	results, err := s.Get("scratch", "", 0, nil)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 entry (sensitive included by default), got %d", len(results))
+	}
+}
+
+func TestSensitive_SearchExcludesWhenDefaultExclude(t *testing.T) {
+	t.Setenv("NOTEBOOK_SENSITIVE_DEFAULT", "exclude")
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "secret espresso note"), true)
+	_, _ = s.Append("scratch", mustJSON(t, "public espresso note"), false)
+
+	hits, err := s.Search("espresso", "scratch", false, 0, nil)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if len(hits) != 1 {
+		t.Fatalf("expected 1 hit (sensitive excluded by default), got %d", len(hits))
+	}
+	if !strings.Contains(hits[0].Snippet, "public") {
+		t.Errorf("expected public hit, got %q", hits[0].Snippet)
+	}
+}
+
+func TestSensitive_BulkAppendMany(t *testing.T) {
+	t.Setenv("NOTEBOOK_SENSITIVE_DEFAULT", "exclude")
+	s := newTestStore(t)
+	_, _ = s.AppendMany("scratch", []any{"sec1", "sec2"}, true)
+	_, _ = s.Append("scratch", mustJSON(t, "public"), false)
+
+	results, err := s.Get("scratch", "", 0, nil)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 visible entry (2 sensitive hidden), got %d", len(results))
+	}
+}
+
+func TestSensitive_PersistsAcrossReopen(t *testing.T) {
+	t.Setenv("NOTEBOOK_SENSITIVE_DEFAULT", "exclude")
+	dir := t.TempDir()
+	s1, _ := NewStore(dir)
+	_, _ = s1.Append("scratch", mustJSON(t, "secret"), true)
+	_, _ = s1.Append("scratch", mustJSON(t, "public"), false)
+
+	s2, _ := NewStore(dir)
+	results, err := s2.Get("scratch", "", 0, nil)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 visible entry after reopen, got %d", len(results))
+	}
+}
+
+// ---- string-JSON deserialise tests ----
+
+func TestGet_DeserialiseStringObject(t *testing.T) {
+	s := newTestStore(t)
+	// Simulate a client that pre-serialised a structured value as a JSON string.
+	raw := json.RawMessage(`"{\"tag\":\"espresso\",\"shot\":18}"`)
+	_, err := s.Append("scratch", raw, false)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	results, err := s.Get("scratch", "", 0, nil)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	e := results[0].(Entry)
+	m, ok := e.Content.(map[string]any)
+	if !ok {
+		t.Fatalf("expected content deserialised to map, got %T: %v", e.Content, e.Content)
+	}
+	if m["tag"] != "espresso" {
+		t.Errorf("expected tag=espresso, got %v", m["tag"])
+	}
+}
+
+func TestGet_DeserialiseStringArray(t *testing.T) {
+	s := newTestStore(t)
+	raw := json.RawMessage(`"[1,2,3]"`)
+	_, _ = s.Append("scratch", raw, false)
+
+	results, _ := s.Get("scratch", "", 0, nil)
+	e := results[0].(Entry)
+	if _, ok := e.Content.([]any); !ok {
+		t.Fatalf("expected content deserialised to array, got %T", e.Content)
+	}
+}
+
+func TestGet_StringNotDeserialised_WhenNotJSON(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "just a plain string"), false)
+
+	results, _ := s.Get("scratch", "", 0, nil)
+	e := results[0].(Entry)
+	if _, ok := e.Content.(string); !ok {
+		t.Errorf("plain string should remain a string, got %T", e.Content)
+	}
+}
+
+func TestGet_StringNotDeserialised_WhenJSONPrimitive(t *testing.T) {
+	// A string whose value is a JSON primitive (e.g. "true", "42") stays a string.
+	s := newTestStore(t)
+	raw := json.RawMessage(`"true"`)
+	_, _ = s.Append("scratch", raw, false)
+
+	results, _ := s.Get("scratch", "", 0, nil)
+	e := results[0].(Entry)
+	if _, ok := e.Content.(string); !ok {
+		t.Errorf("JSON-primitive string should remain a string, got %T", e.Content)
+	}
+}
+
+func TestGet_JqSeesDeserialised(t *testing.T) {
+	s := newTestStore(t)
+	// Store a pre-serialised object.
+	raw := json.RawMessage(`"{\"tag\":\"espresso\"}"`)
+	_, _ = s.Append("scratch", raw, false)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"tag": "filter"}), false)
+
+	// jq should see the deserialised content, not the raw string.
+	results, err := s.Get("scratch", `select(.content.tag == "espresso")`, 0, nil)
+	if err != nil {
+		t.Fatalf("get with jq: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d (jq may not see deserialised content)", len(results))
 	}
 }

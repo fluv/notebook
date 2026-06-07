@@ -21,6 +21,7 @@ type appendArgs struct {
 	Namespace string `json:"namespace"`
 	Content   any    `json:"content,omitempty"`
 	Entries   []any  `json:"entries,omitempty"`
+	Sensitive bool   `json:"sensitive,omitempty"`
 }
 
 // appendInputSchema overrides the SDK's auto-generated schema. The inferer
@@ -51,6 +52,10 @@ var appendInputSchema = &jsonschema.Schema{
 				Types: []string{"object", "array", "string", "number", "boolean", "null"},
 			},
 		},
+		"sensitive": {
+			Type:        "boolean",
+			Description: "when true, mark this entry (or all bulk entries) as sensitive; hidden from get/search when NOTEBOOK_SENSITIVE_DEFAULT=exclude",
+		},
 	},
 	Required: []string{"namespace"},
 }
@@ -63,9 +68,10 @@ type appendResult struct {
 }
 
 type getArgs struct {
-	Namespace string `json:"namespace" jsonschema:"namespace to read from"`
-	Jq        string `json:"jq,omitempty" jsonschema:"optional jq filter; applied to each entry; runs before last; an empty/no-output filter drops the entry"`
-	Last      int    `json:"last,omitempty" jsonschema:"optional cap; if >0, return only the final N results after jq"`
+	Namespace        string `json:"namespace" jsonschema:"namespace to read from"`
+	Jq               string `json:"jq,omitempty" jsonschema:"optional jq filter; applied to each entry; runs before last; an empty/no-output filter drops the entry"`
+	Last             int    `json:"last,omitempty" jsonschema:"optional cap; if >0, return only the final N results after jq"`
+	IncludeSensitive *bool  `json:"include_sensitive,omitempty" jsonschema:"override the server-level NOTEBOOK_SENSITIVE_DEFAULT: true includes sensitive entries, false excludes them; omit to use server default"`
 }
 
 type getResult struct {
@@ -97,10 +103,11 @@ type describeResult struct {
 }
 
 type searchArgs struct {
-	Query     string `json:"query" jsonschema:"literal substring (verbatim, not keyword-decomposed) or Go regex; for multi-keyword OR use regex mode with alternation: shopping|recipe|meal"`
-	Namespace string `json:"namespace,omitempty" jsonschema:"namespace to search; omit to search all namespaces"`
-	Regex     bool   `json:"regex,omitempty" jsonschema:"when true, treat query as a Go regular expression"`
-	Limit     int    `json:"limit,omitempty" jsonschema:"maximum number of hits to return; defaults to 20"`
+	Query            string `json:"query" jsonschema:"literal substring (verbatim, not keyword-decomposed) or Go regex; for multi-keyword OR use regex mode with alternation: shopping|recipe|meal"`
+	Namespace        string `json:"namespace,omitempty" jsonschema:"namespace to search; omit to search all namespaces"`
+	Regex            bool   `json:"regex,omitempty" jsonschema:"when true, treat query as a Go regular expression"`
+	Limit            int    `json:"limit,omitempty" jsonschema:"maximum number of hits to return; defaults to 20"`
+	IncludeSensitive *bool  `json:"include_sensitive,omitempty" jsonschema:"override the server-level NOTEBOOK_SENSITIVE_DEFAULT: true includes sensitive entries, false excludes them; omit to use server default"`
 }
 
 type searchResult struct {
@@ -204,22 +211,24 @@ func registerTools(server *mcp.Server, store *Store) {
 			return nil, appendResult{}, errors.New("provide either content (single value) or entries (array of values)")
 		}
 		if hasBulk {
-			entries, err := store.AppendMany(args.Namespace, args.Entries)
+			entries, err := store.AppendMany(args.Namespace, args.Entries, args.Sensitive)
 			observe("append", start, err,
 				slog.String("namespace", args.Namespace),
 				slog.String("mode", "bulk"),
 				slog.Int("count", len(args.Entries)),
+				slog.Bool("sensitive", args.Sensitive),
 			)
 			if err != nil {
 				return nil, appendResult{}, err
 			}
 			return nil, appendResult{Entries: entries}, nil
 		}
-		entry, err := store.Append(args.Namespace, args.Content)
+		entry, err := store.Append(args.Namespace, args.Content, args.Sensitive)
 		observe("append", start, err,
 			slog.String("namespace", args.Namespace),
 			slog.String("mode", "single"),
 			slog.Int("count", 1),
+			slog.Bool("sensitive", args.Sensitive),
 		)
 		if err != nil {
 			return nil, appendResult{}, err
@@ -232,7 +241,11 @@ func registerTools(server *mcp.Server, store *Store) {
 		Description: "Read entries from a namespace. Tombstoned entries are excluded. " +
 			"If `jq` is set, each entry is piped through the jq filter and the filter's " +
 			"outputs are collected (e.g. `select(.content.tag == \"espresso\")`). If `last` " +
-			"is set, only the final N results (post-jq) are returned.",
+			"is set, only the final N results (post-jq) are returned. " +
+			"Sensitive-marked entries are shown or hidden according to `include_sensitive` " +
+			"(omit to use the server default set by NOTEBOOK_SENSITIVE_DEFAULT). " +
+			"Timestamps are second-precision; content that was stored as a JSON-encoded string " +
+			"is transparently deserialised to its original structure.",
 		Annotations: &mcp.ToolAnnotations{
 			Title:         "Get entries",
 			ReadOnlyHint:  true,
@@ -240,7 +253,7 @@ func registerTools(server *mcp.Server, store *Store) {
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args getArgs) (*mcp.CallToolResult, getResult, error) {
 		start := time.Now()
-		entries, err := store.Get(args.Namespace, args.Jq, args.Last)
+		entries, err := store.Get(args.Namespace, args.Jq, args.Last, args.IncludeSensitive)
 		observe("get", start, err,
 			slog.String("namespace", args.Namespace),
 			slog.Bool("has_jq", args.Jq != ""),
@@ -292,7 +305,7 @@ func registerTools(server *mcp.Server, store *Store) {
 		},
 	}, func(ctx context.Context, req *mcp.CallToolRequest, args searchArgs) (*mcp.CallToolResult, searchResult, error) {
 		start := time.Now()
-		hits, err := store.Search(args.Query, args.Namespace, args.Regex, args.Limit)
+		hits, err := store.Search(args.Query, args.Namespace, args.Regex, args.Limit, args.IncludeSensitive)
 		searchScope := args.Namespace
 		if searchScope == "" {
 			searchScope = "*"
