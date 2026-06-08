@@ -135,9 +135,9 @@ func buildGetInputSchema(defaultInclude bool) *jsonschema.Schema {
 	return &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
-			"namespace": {Type: "string", Description: "namespace to read from"},
-			"jq":        {Type: "string", Description: "optional jq filter; applied to each entry; runs before last; an empty/no-output filter drops the entry"},
-			"last":      {Type: "integer", Description: "optional cap; if >0, return only the final N results after jq"},
+			"namespace":         {Type: "string", Description: "namespace to read from"},
+			"jq":                {Type: "string", Description: "optional jq filter; applied to each entry; runs before last; an empty/no-output filter drops the entry"},
+			"last":              {Type: "integer", Description: "optional cap; if >0, return only the final N results after jq"},
 			"include_sensitive": {Type: "boolean", Description: buildSensitiveDesc(defaultInclude)},
 		},
 		Required: []string{"namespace"},
@@ -150,10 +150,10 @@ func buildSearchInputSchema(defaultInclude bool) *jsonschema.Schema {
 	return &jsonschema.Schema{
 		Type: "object",
 		Properties: map[string]*jsonschema.Schema{
-			"query":     {Type: "string", Description: "literal substring (verbatim, not keyword-decomposed) or Go regex; for multi-keyword OR use regex mode with alternation: shopping|recipe|meal"},
-			"namespace": {Type: "string", Description: "namespace to search; omit to search all namespaces"},
-			"regex":     {Type: "boolean", Description: "when true, treat query as a Go regular expression"},
-			"limit":     {Type: "integer", Description: "maximum number of hits to return; defaults to 20"},
+			"query":             {Type: "string", Description: "literal substring (verbatim, not keyword-decomposed) or Go regex; for multi-keyword OR use regex mode with alternation: shopping|recipe|meal"},
+			"namespace":         {Type: "string", Description: "namespace to search; omit to search all namespaces"},
+			"regex":             {Type: "boolean", Description: "when true, treat query as a Go regular expression"},
+			"limit":             {Type: "integer", Description: "maximum number of hits to return; defaults to 20"},
 			"include_sensitive": {Type: "boolean", Description: buildSensitiveDesc(defaultInclude)},
 		},
 		Required: []string{"query"},
