@@ -43,20 +43,25 @@ type Entry struct {
 // per-namespace mutex; single-replica deployment guarantees no cross-process
 // contention.
 type Store struct {
-	dir     string
-	muRoot  sync.Mutex
-	mus     map[string]*sync.Mutex // per-namespace mutex map
-	entropy ulid.MonotonicReader
+	dir                     string
+	muRoot                  sync.Mutex
+	mus                     map[string]*sync.Mutex // per-namespace mutex map
+	entropy                 ulid.MonotonicReader
+	includeSensitiveDefault bool // set from NOTEBOOK_SENSITIVE_DEFAULT env var
 }
 
+// NewStore initialises the store. Set NOTEBOOK_SENSITIVE_DEFAULT=exclude to
+// hide sensitive-marked entries from bare get/search calls by default; any
+// other value (including unset) includes them.
 func NewStore(dir string) (*Store, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create data dir: %w", err)
 	}
 	return &Store{
-		dir:     dir,
-		mus:     make(map[string]*sync.Mutex),
-		entropy: &ulid.LockedMonotonicReader{MonotonicReader: ulid.Monotonic(rand.Reader, 0)},
+		dir:                     dir,
+		mus:                     make(map[string]*sync.Mutex),
+		entropy:                 &ulid.LockedMonotonicReader{MonotonicReader: ulid.Monotonic(rand.Reader, 0)},
+		includeSensitiveDefault: os.Getenv("NOTEBOOK_SENSITIVE_DEFAULT") != "exclude",
 	}, nil
 }
 
@@ -86,6 +91,73 @@ func (s *Store) tombstonePath(ns string) string {
 	return filepath.Join(s.dir, ns+".tombstones")
 }
 
+// truncateTS parses an RFC3339Nano timestamp and returns it at second
+// precision. Milliseconds are irrelevant to callers; removing them saves
+// bytes in every tool response. The on-disk format remains RFC3339Nano.
+func truncateTS(ts string) string {
+	t, err := time.Parse(time.RFC3339Nano, ts)
+	if err != nil {
+		return ts
+	}
+	return t.Format(time.RFC3339)
+}
+
+// isSensitiveEntry reports whether an entry should be treated as sensitive.
+// An entry is sensitive when its content is a JSON object with "exportable"
+// set to the boolean false. Absent field, null, true, and non-object content
+// are all treated as non-sensitive (exportable by default).
+func isSensitiveEntry(content any) bool {
+	m, ok := content.(map[string]any)
+	if !ok {
+		return false
+	}
+	exp, ok := m["exportable"]
+	if !ok {
+		return false
+	}
+	b, ok := exp.(bool)
+	return ok && !b
+}
+
+// isSensitiveRaw is like isSensitiveEntry but operates on the raw JSON of the
+// content field, used in search paths where content hasn't been fully decoded.
+func isSensitiveRaw(contentJSON json.RawMessage) bool {
+	var m map[string]any
+	if err := json.Unmarshal(contentJSON, &m); err != nil {
+		return false
+	}
+	exp, ok := m["exportable"]
+	if !ok {
+		return false
+	}
+	b, ok := exp.(bool)
+	return ok && !b
+}
+
+// tryDeserialiseString checks whether v is a string whose value is a valid
+// JSON object or array. If so, the parsed structure is returned in place of
+// the string. Otherwise v is returned unchanged.
+//
+// This undoes client-side pre-serialisation: some MCP clients (e.g. claude.ai)
+// JSON-encode structured values before transmission even when the schema
+// declares multi-type input, producing content stored as a JSON string rather
+// than as the intended structure.
+func tryDeserialiseString(v any) any {
+	s, ok := v.(string)
+	if !ok {
+		return v
+	}
+	var inner any
+	if err := json.Unmarshal([]byte(s), &inner); err != nil {
+		return v
+	}
+	switch inner.(type) {
+	case map[string]any, []any:
+		return inner
+	}
+	return v
+}
+
 // newID generates a monotonic ULID with millisecond precision. Monotonic
 // ordering is preserved across same-millisecond calls within a process.
 func (s *Store) newID(t time.Time) (string, error) {
@@ -99,6 +171,13 @@ func (s *Store) newID(t time.Time) (string, error) {
 // Append serialises a new entry to the namespace's JSONL file. Content
 // may be any JSON value (string, number, object, array, null). The
 // caller passes a native Go value; Append marshals it.
+//
+// Sensitivity is declared in the content itself: entries whose content is a
+// JSON object with "exportable": false are treated as sensitive at read time
+// and filtered out by Get/Search when NOTEBOOK_SENSITIVE_DEFAULT=exclude.
+//
+// The returned entry carries a second-precision timestamp (not nano); the
+// on-disk record retains full RFC3339Nano precision.
 func (s *Store) Append(ns string, content any) (Entry, error) {
 	if err := validateNamespace(ns); err != nil {
 		return Entry{}, err
@@ -111,7 +190,7 @@ func (s *Store) Append(ns string, content any) (Entry, error) {
 	}
 	entry := Entry{
 		ID:      id,
-		TS:      now.Format(time.RFC3339Nano),
+		TS:      now.Format(time.RFC3339Nano), // full precision on disk
 		Content: content,
 	}
 	line, err := json.Marshal(entry)
@@ -135,6 +214,7 @@ func (s *Store) Append(ns string, content any) (Entry, error) {
 	if err := f.Sync(); err != nil {
 		return Entry{}, fmt.Errorf("fsync: %w", err)
 	}
+	entry.TS = truncateTS(entry.TS) // truncate for response
 	return entry, nil
 }
 
@@ -143,7 +223,8 @@ func (s *Store) Append(ns string, content any) (Entry, error) {
 // so they are contiguous on disk and cheaper than N separate Append calls.
 //
 // Contents are marshalled before acquiring the lock so the critical section is
-// as short as possible.
+// as short as possible. Returned entries carry second-precision timestamps.
+// Sensitivity is per-entry in content (see Append).
 func (s *Store) AppendMany(ns string, contents []any) ([]Entry, error) {
 	if err := validateNamespace(ns); err != nil {
 		return nil, err
@@ -185,6 +266,9 @@ func (s *Store) AppendMany(ns string, contents []any) ([]Entry, error) {
 	}
 	if err := f.Sync(); err != nil {
 		return nil, fmt.Errorf("fsync: %w", err)
+	}
+	for i := range entries {
+		entries[i].TS = truncateTS(entries[i].TS)
 	}
 	return entries, nil
 }
@@ -248,11 +332,14 @@ func (s *Store) loadTombstones(ns string) (map[string]struct{}, error) {
 // and the filter's output values are collected. If last > 0, only the final
 // last results are returned.
 //
-// Without a jq filter the result is the entry stream as-is (a list of
-// {id, ts, content} objects). With a jq filter, the result is whatever the
-// filter produces — typically a filtered or projected entry list, but the
-// caller is free to write a filter that reshapes entries arbitrarily.
-func (s *Store) Get(ns string, jqFilter string, last int) ([]any, error) {
+// includeSensitive controls whether sensitive-marked entries are returned. If
+// nil, the store's includeSensitiveDefault (from NOTEBOOK_SENSITIVE_DEFAULT)
+// is used. Pass a non-nil pointer to override per-call.
+//
+// Timestamps in results are truncated to second precision (RFC3339). The
+// on-disk format is unchanged (RFC3339Nano). Content that is a JSON-encoded
+// string containing an object or array is transparently deserialised.
+func (s *Store) Get(ns string, jqFilter string, last int, includeSensitive *bool) ([]any, error) {
 	if err := validateNamespace(ns); err != nil {
 		return nil, err
 	}
@@ -264,6 +351,11 @@ func (s *Store) Get(ns string, jqFilter string, last int) ([]any, error) {
 	tombstones, err := s.loadTombstones(ns)
 	if err != nil {
 		return nil, fmt.Errorf("load tombstones: %w", err)
+	}
+
+	includeSens := s.includeSensitiveDefault
+	if includeSensitive != nil {
+		includeSens = *includeSensitive
 	}
 
 	var query *gojq.Query
@@ -301,7 +393,12 @@ func (s *Store) Get(ns string, jqFilter string, last int) ([]any, error) {
 		if _, dead := tombstones[entry.ID]; dead {
 			continue
 		}
+		if !includeSens && isSensitiveEntry(entry.Content) {
+			continue
+		}
 		if query == nil {
+			entry.TS = truncateTS(entry.TS)
+			entry.Content = tryDeserialiseString(entry.Content)
 			results = append(results, entry)
 			continue
 		}
@@ -309,6 +406,12 @@ func (s *Store) Get(ns string, jqFilter string, last int) ([]any, error) {
 		var generic any
 		if err := json.Unmarshal(raw, &generic); err != nil {
 			return nil, fmt.Errorf("decode line %d for jq: %w", lineNo, err)
+		}
+		if m, ok := generic.(map[string]any); ok {
+			if ts, ok := m["ts"].(string); ok {
+				m["ts"] = truncateTS(ts)
+			}
+			m["content"] = tryDeserialiseString(m["content"])
 		}
 		iter := query.Run(generic)
 		for {
@@ -700,6 +803,8 @@ lineLoop:
 	if shapeMode {
 		desc.Shape = pathAccToShape(shapeAcc)
 	}
+	desc.FirstTS = truncateTS(desc.FirstTS)
+	desc.LastTS = truncateTS(desc.LastTS)
 	return desc, nil
 }
 
@@ -736,8 +841,9 @@ func (s *Store) ListNamespaces() ([]NamespaceSummary, error) {
 
 // searchOne scans one namespace JSONL for entries matching the given matcher.
 // It stops after collecting remaining hits. The caller holds no lock; this
-// method acquires the namespace lock internally.
-func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining int) ([]SearchHit, error) {
+// method acquires the namespace lock internally. Sensitive-marked entries are
+// excluded when includeSens is false.
+func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining int, includeSens bool) ([]SearchHit, error) {
 	mu := s.lockFor(ns)
 	mu.Lock()
 	defer mu.Unlock()
@@ -767,13 +873,17 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 			continue
 		}
 		var hdr struct {
-			ID string `json:"id"`
-			TS string `json:"ts"`
+			ID      string          `json:"id"`
+			TS      string          `json:"ts"`
+			Content json.RawMessage `json:"content"`
 		}
 		if err := json.Unmarshal(raw, &hdr); err != nil {
 			return nil, fmt.Errorf("parse line %d in %s: %w", lineNo, ns, err)
 		}
 		if _, dead := tombstones[hdr.ID]; dead {
+			continue
+		}
+		if !includeSens && isSensitiveRaw(hdr.Content) {
 			continue
 		}
 		text := string(raw)
@@ -794,7 +904,7 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 		hits = append(hits, SearchHit{
 			Namespace: ns,
 			ID:        hdr.ID,
-			TS:        hdr.TS,
+			TS:        truncateTS(hdr.TS),
 			Snippet:   makeSnippet(snippetText, snippetPos, 120),
 		})
 		if len(hits) >= remaining {
@@ -811,12 +921,20 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 // contains query as a substring (or regex when useRegex is true). Tombstoned
 // entries are excluded. Returns up to limit hits (default 20). The snippet
 // field in each hit is a ~120-rune context window around the first match.
-func (s *Store) Search(query, namespace string, useRegex bool, limit int) ([]SearchHit, error) {
+//
+// includeSensitive follows the same semantics as Get: nil uses the store
+// default (NOTEBOOK_SENSITIVE_DEFAULT); non-nil overrides per-call.
+func (s *Store) Search(query, namespace string, useRegex bool, limit int, includeSensitive *bool) ([]SearchHit, error) {
 	if query == "" {
 		return nil, fmt.Errorf("query must not be empty")
 	}
 	if limit <= 0 {
 		limit = 20
+	}
+
+	includeSens := s.includeSensitiveDefault
+	if includeSensitive != nil {
+		includeSens = *includeSensitive
 	}
 
 	var matcher func(string) (int, bool)
@@ -859,7 +977,7 @@ func (s *Store) Search(query, namespace string, useRegex bool, limit int) ([]Sea
 		if len(hits) >= limit {
 			break
 		}
-		nsHits, err := s.searchOne(ns, matcher, limit-len(hits))
+		nsHits, err := s.searchOne(ns, matcher, limit-len(hits), includeSens)
 		if err != nil {
 			return nil, err
 		}
