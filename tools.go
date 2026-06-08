@@ -66,7 +66,7 @@ type getArgs struct {
 	Namespace        string `json:"namespace" jsonschema:"namespace to read from"`
 	Jq               string `json:"jq,omitempty" jsonschema:"optional jq filter; applied to each entry; runs before last; an empty/no-output filter drops the entry"`
 	Last             int    `json:"last,omitempty" jsonschema:"optional cap; if >0, return only the final N results after jq"`
-	IncludeSensitive *bool  `json:"include_sensitive,omitempty" jsonschema:"override the server-level NOTEBOOK_SENSITIVE_DEFAULT: true includes sensitive entries, false excludes them; omit to use server default"`
+	IncludeSensitive *bool  `json:"include_sensitive,omitempty"`
 }
 
 type getResult struct {
@@ -102,7 +102,7 @@ type searchArgs struct {
 	Namespace        string `json:"namespace,omitempty" jsonschema:"namespace to search; omit to search all namespaces"`
 	Regex            bool   `json:"regex,omitempty" jsonschema:"when true, treat query as a Go regular expression"`
 	Limit            int    `json:"limit,omitempty" jsonschema:"maximum number of hits to return; defaults to 20"`
-	IncludeSensitive *bool  `json:"include_sensitive,omitempty" jsonschema:"override the server-level NOTEBOOK_SENSITIVE_DEFAULT: true includes sensitive entries, false excludes them; omit to use server default"`
+	IncludeSensitive *bool  `json:"include_sensitive,omitempty"`
 }
 
 type searchResult struct {
@@ -117,6 +117,48 @@ func boolPtr(b bool) *bool { return &b }
 // interacts with its own PVC-backed storage, never with external
 // entities. Set once and reused on every tool.
 var closedWorld = boolPtr(false)
+
+// buildSensitiveDesc returns the description for the include_sensitive parameter,
+// naming the current server default so clients don't need to know the env var.
+func buildSensitiveDesc(defaultInclude bool) string {
+	defaultWord := "include"
+	if !defaultInclude {
+		defaultWord = "exclude"
+	}
+	return "override the server default: true includes sensitive entries, false excludes them; " +
+		"omit to " + defaultWord + " (current server default)"
+}
+
+// buildGetInputSchema constructs the input schema for the get tool with an
+// include_sensitive description that names the current server default.
+func buildGetInputSchema(defaultInclude bool) *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"namespace": {Type: "string", Description: "namespace to read from"},
+			"jq":        {Type: "string", Description: "optional jq filter; applied to each entry; runs before last; an empty/no-output filter drops the entry"},
+			"last":      {Type: "integer", Description: "optional cap; if >0, return only the final N results after jq"},
+			"include_sensitive": {Type: "boolean", Description: buildSensitiveDesc(defaultInclude)},
+		},
+		Required: []string{"namespace"},
+	}
+}
+
+// buildSearchInputSchema constructs the input schema for the search tool with
+// an include_sensitive description that names the current server default.
+func buildSearchInputSchema(defaultInclude bool) *jsonschema.Schema {
+	return &jsonschema.Schema{
+		Type: "object",
+		Properties: map[string]*jsonschema.Schema{
+			"query":     {Type: "string", Description: "literal substring (verbatim, not keyword-decomposed) or Go regex; for multi-keyword OR use regex mode with alternation: shopping|recipe|meal"},
+			"namespace": {Type: "string", Description: "namespace to search; omit to search all namespaces"},
+			"regex":     {Type: "boolean", Description: "when true, treat query as a Go regular expression"},
+			"limit":     {Type: "integer", Description: "maximum number of hits to return; defaults to 20"},
+			"include_sensitive": {Type: "boolean", Description: buildSensitiveDesc(defaultInclude)},
+		},
+		Required: []string{"query"},
+	}
+}
 
 // registerTools wires the notebook tools onto the MCP server. Each handler
 // is a thin shim that validates input and delegates to the store.
@@ -230,7 +272,8 @@ func registerTools(server *mcp.Server, store *Store) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "get",
+		Name:        "get",
+		InputSchema: buildGetInputSchema(store.includeSensitiveDefault),
 		Description: "Read entries from a namespace. Tombstoned entries are excluded. " +
 			"If `jq` is set, each entry is piped through the jq filter and the filter's " +
 			"outputs are collected (e.g. `select(.content.tag == \"espresso\")`). If `last` " +
@@ -284,7 +327,8 @@ func registerTools(server *mcp.Server, store *Store) {
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
-		Name: "search",
+		Name:        "search",
+		InputSchema: buildSearchInputSchema(store.includeSensitiveDefault),
 		Description: "Scan one or all namespaces for entries whose raw JSON contains a match. " +
 			"Matching is substring by default — the query is matched verbatim, not decomposed into keywords. " +
 			"For multi-keyword OR searches, set `regex: true` and use alternation: `shopping|recipe|meal`. " +
