@@ -158,6 +158,116 @@ func tryDeserialiseString(v any) any {
 	return v
 }
 
+// updateRec is the on-disk shape of an update operation. It is stored as a
+// JSONL line alongside regular entries in the same namespace file. The "op"
+// field distinguishes update records from regular entries during scan.
+type updateRec struct {
+	Op       string `json:"op"` // always "update"
+	ID       string `json:"id"`
+	UpdateTS string `json:"update_ts"`
+	Field    string `json:"field"`
+	Old      any    `json:"old"`
+	New      any    `json:"new"`
+}
+
+// UpdateError is returned from Update when a validation rule prevents the
+// operation. The Code field is one of the machine-readable codes in the spec.
+type UpdateError struct {
+	Code           string `json:"error"`
+	Message        string `json:"message"`
+	OriginalLength int    `json:"original_length,omitempty"`
+	MaxAllowed     int    `json:"max_allowed,omitempty"`
+	Provided       int    `json:"provided,omitempty"`
+}
+
+func (e *UpdateError) Error() string { return e.Code + ": " + e.Message }
+
+// UpdateResult is returned from a successful Update call.
+type UpdateResult struct {
+	ID        string `json:"id"`
+	Namespace string `json:"namespace"`
+	UpdateTS  string `json:"update_ts"`
+	Field     string `json:"field"`
+	Old       any    `json:"old"`
+	New       any    `json:"new"`
+}
+
+// scanAllRecords reads the namespace JSONL and separates regular entries from
+// update records. It returns entries in insertion order and update records
+// keyed by entry ID (in file order, which equals chronological order).
+//
+// The caller must hold the namespace mutex. Missing file is not an error.
+func (s *Store) scanAllRecords(ns string) (entries []Entry, updatesByID map[string][]updateRec, err error) {
+	updatesByID = make(map[string][]updateRec)
+	f, err := os.Open(s.jsonlPath(ns))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, updatesByID, nil
+		}
+		return nil, nil, fmt.Errorf("open jsonl: %w", err)
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	lineNo := 0
+	for scanner.Scan() {
+		lineNo++
+		b := scanner.Bytes()
+		if len(b) == 0 {
+			continue
+		}
+		var peek struct {
+			Op       string `json:"op,omitempty"`
+			UpdateTS string `json:"update_ts,omitempty"`
+		}
+		if err := json.Unmarshal(b, &peek); err != nil {
+			return nil, nil, fmt.Errorf("parse line %d: %w", lineNo, err)
+		}
+		if peek.Op == "update" && peek.UpdateTS != "" {
+			var rec updateRec
+			if err := json.Unmarshal(b, &rec); err != nil {
+				return nil, nil, fmt.Errorf("parse update record line %d: %w", lineNo, err)
+			}
+			updatesByID[rec.ID] = append(updatesByID[rec.ID], rec)
+		} else {
+			var entry Entry
+			if err := json.Unmarshal(b, &entry); err != nil {
+				return nil, nil, fmt.Errorf("parse entry line %d: %w", lineNo, err)
+			}
+			entries = append(entries, entry)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("scan jsonl: %w", err)
+	}
+	return entries, updatesByID, nil
+}
+
+// applyUpdateRecs returns an Entry with all update records applied in order.
+// The last update to a given field wins. Entries with non-object content can
+// only be updated via field "." (whole-content replacement).
+func applyUpdateRecs(entry Entry, recs []updateRec) Entry {
+	for _, rec := range recs {
+		if rec.Field == "." {
+			entry.Content = rec.New
+		} else {
+			m, ok := entry.Content.(map[string]any)
+			if !ok {
+				continue
+			}
+			// shallow-copy so we don't mutate the original map
+			updated := make(map[string]any, len(m))
+			for k, v := range m {
+				updated[k] = v
+			}
+			updated[rec.Field] = rec.New
+			entry.Content = updated
+		}
+	}
+	return entry
+}
+
 // newID generates a monotonic ULID with millisecond precision. Monotonic
 // ordering is preserved across same-millisecond calls within a process.
 func (s *Store) newID(t time.Time) (string, error) {
@@ -327,8 +437,11 @@ func (s *Store) loadTombstones(ns string) (map[string]struct{}, error) {
 	return set, scanner.Err()
 }
 
-// Get reads entries from the namespace, filtering out tombstoned IDs. If
-// jqFilter is non-empty, each surviving entry is passed through the filter
+// Get reads entries from the namespace, filtering out tombstoned IDs. Update
+// records are applied before entries are returned, so the result reflects the
+// current (corrected) state of each entry.
+//
+// If jqFilter is non-empty, each surviving entry is passed through the filter
 // and the filter's output values are collected. If last > 0, only the final
 // last results are returned.
 //
@@ -367,51 +480,36 @@ func (s *Store) Get(ns string, jqFilter string, last int, includeSensitive *bool
 		query = q
 	}
 
-	f, err := os.Open(s.jsonlPath(ns))
+	entries, updatesByID, err := s.scanAllRecords(ns)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return []any{}, nil
-		}
-		return nil, fmt.Errorf("open jsonl: %w", err)
+		return nil, err
 	}
-	defer f.Close()
 
 	results := []any{}
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024) // tolerate up to 8MB lines
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		raw := scanner.Bytes()
-		if len(raw) == 0 {
-			continue
-		}
-		var entry Entry
-		if err := json.Unmarshal(raw, &entry); err != nil {
-			return nil, fmt.Errorf("parse line %d: %w", lineNo, err)
-		}
+	for _, entry := range entries {
 		if _, dead := tombstones[entry.ID]; dead {
 			continue
+		}
+		if recs, ok := updatesByID[entry.ID]; ok {
+			entry = applyUpdateRecs(entry, recs)
 		}
 		if !includeSens && isSensitiveEntry(entry.Content) {
 			continue
 		}
+		entry.TS = truncateTS(entry.TS)
+		entry.Content = tryDeserialiseString(entry.Content)
 		if query == nil {
-			entry.TS = truncateTS(entry.TS)
-			entry.Content = tryDeserialiseString(entry.Content)
 			results = append(results, entry)
 			continue
 		}
-		// Decode the entry once more into a generic map so gojq can walk it.
-		var generic any
-		if err := json.Unmarshal(raw, &generic); err != nil {
-			return nil, fmt.Errorf("decode line %d for jq: %w", lineNo, err)
+		// Marshal the (possibly updated) entry back to JSON so gojq can walk it.
+		b, err := json.Marshal(entry)
+		if err != nil {
+			return nil, fmt.Errorf("marshal entry %s for jq: %w", entry.ID, err)
 		}
-		if m, ok := generic.(map[string]any); ok {
-			if ts, ok := m["ts"].(string); ok {
-				m["ts"] = truncateTS(ts)
-			}
-			m["content"] = tryDeserialiseString(m["content"])
+		var generic any
+		if err := json.Unmarshal(b, &generic); err != nil {
+			return nil, fmt.Errorf("decode entry %s for jq: %w", entry.ID, err)
 		}
 		iter := query.Run(generic)
 		for {
@@ -420,13 +518,10 @@ func (s *Store) Get(ns string, jqFilter string, last int, includeSensitive *bool
 				break
 			}
 			if err, isErr := v.(error); isErr {
-				return nil, fmt.Errorf("jq error on line %d: %w", lineNo, err)
+				return nil, fmt.Errorf("jq error on entry %s: %w", entry.ID, err)
 			}
 			results = append(results, v)
 		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan jsonl: %w", err)
 	}
 
 	if last > 0 && len(results) > last {
@@ -733,6 +828,14 @@ lineLoop:
 		if len(raw) == 0 {
 			continue
 		}
+		// Skip update records — they are not entries and must not inflate counts.
+		var peek struct {
+			Op       string `json:"op,omitempty"`
+			UpdateTS string `json:"update_ts,omitempty"`
+		}
+		if err := json.Unmarshal(raw, &peek); err == nil && peek.Op == "update" && peek.UpdateTS != "" {
+			continue
+		}
 		var entry Entry
 		if err := json.Unmarshal(raw, &entry); err != nil {
 			desc.ErroredCount++
@@ -872,6 +975,14 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 		if len(raw) == 0 {
 			continue
 		}
+		// Skip update records — they're not entries and would produce misleading hits.
+		var opPeek struct {
+			Op       string `json:"op,omitempty"`
+			UpdateTS string `json:"update_ts,omitempty"`
+		}
+		if err := json.Unmarshal(raw, &opPeek); err == nil && opPeek.Op == "update" && opPeek.UpdateTS != "" {
+			continue
+		}
 		var hdr struct {
 			ID      string          `json:"id"`
 			TS      string          `json:"ts"`
@@ -984,4 +1095,177 @@ func (s *Store) Search(query, namespace string, useRegex bool, limit int, includ
 		hits = append(hits, nsHits...)
 	}
 	return hits, nil
+}
+
+// Update patches a single field of an existing entry in place. It is intended
+// for minor factual corrections — stale dates, small detail changes, short
+// qualifiers — where tombstone + reappend would destroy correct sibling claims.
+//
+// Rules enforced:
+//   - The entry must exist and not be tombstoned.
+//   - "id" and "ts" are immutable.
+//   - Top-level keys of an object entry cannot be added or removed (KEY_DRIFT).
+//   - The field's JSON type cannot change (TYPE_MISMATCH).
+//   - String fields are capped at max(2×original_length, original_length+100) runes (TOO_LONG).
+//   - Entries with exportable:false require includeSensitive=true (SENSITIVE_REQUIRES_OPT_IN).
+//
+// Use field "." to replace the entire content of a plain-string or other
+// non-object entry.
+//
+// Updates are stored as append records in the same JSONL file. The read path
+// (Get) folds them in chronological order; the last update to a given field
+// wins.
+func (s *Store) Update(ns, id, field string, value any, includeSensitive bool) (res UpdateResult, err error) {
+	if err := validateNamespace(ns); err != nil {
+		return UpdateResult{}, err
+	}
+	if _, err := ulid.Parse(id); err != nil {
+		return UpdateResult{}, fmt.Errorf("invalid id %q: %w", id, err)
+	}
+	if field == "id" || field == "ts" {
+		return UpdateResult{}, &UpdateError{
+			Code:    "IMMUTABLE_FIELD",
+			Message: "id and ts cannot be updated",
+		}
+	}
+
+	mu := s.lockFor(ns)
+	mu.Lock()
+	defer mu.Unlock()
+
+	tombstones, err := s.loadTombstones(ns)
+	if err != nil {
+		return UpdateResult{}, fmt.Errorf("load tombstones: %w", err)
+	}
+
+	entries, updatesByID, err := s.scanAllRecords(ns)
+	if err != nil {
+		return UpdateResult{}, err
+	}
+
+	var found *Entry
+	for i := range entries {
+		if entries[i].ID == id {
+			found = &entries[i]
+			break
+		}
+	}
+	if found == nil {
+		return UpdateResult{}, &UpdateError{
+			Code:    "ENTRY_NOT_FOUND",
+			Message: fmt.Sprintf("entry %s not found in namespace %s", id, ns),
+		}
+	}
+	if _, dead := tombstones[id]; dead {
+		return UpdateResult{}, &UpdateError{
+			Code:    "ENTRY_TOMBSTONED",
+			Message: "entry has been tombstoned; use entries to write a replacement",
+		}
+	}
+
+	// Apply existing update records to get the current (post-correction) state.
+	current := *found
+	if recs, ok := updatesByID[id]; ok {
+		current = applyUpdateRecs(current, recs)
+	}
+
+	if !includeSensitive && isSensitiveEntry(current.Content) {
+		return UpdateResult{}, &UpdateError{
+			Code:    "SENSITIVE_REQUIRES_OPT_IN",
+			Message: "entry has exportable:false; re-send with include_sensitive:true",
+		}
+	}
+
+	// Determine old value; validate field, key drift, and types.
+	var oldValue any
+	if field == "." {
+		oldValue = current.Content
+	} else {
+		m, ok := current.Content.(map[string]any)
+		if !ok {
+			return UpdateResult{}, &UpdateError{
+				Code:    "KEY_DRIFT",
+				Message: "content is not a JSON object; use field '.' for non-object entries. Use delete + entries instead.",
+			}
+		}
+		existing, ok := m[field]
+		if !ok {
+			return UpdateResult{}, &UpdateError{
+				Code:    "KEY_DRIFT",
+				Message: fmt.Sprintf("key %q does not exist; top-level keys may not change via update. Use delete + entries instead.", field),
+			}
+		}
+		oldValue = existing
+	}
+
+	oldType := jsonType(oldValue)
+	newType := jsonType(value)
+	if oldType != newType {
+		return UpdateResult{}, &UpdateError{
+			Code:    "TYPE_MISMATCH",
+			Message: fmt.Sprintf("field type must not change: was %s, got %s. Use delete + entries instead.", oldType, newType),
+		}
+	}
+
+	if oldType == "string" {
+		oldStr, _ := oldValue.(string)
+		newStr, _ := value.(string)
+		origLen := utf8.RuneCountInString(oldStr)
+		newLen := utf8.RuneCountInString(newStr)
+		maxAllowed := 2 * origLen
+		if origLen+100 > maxAllowed {
+			maxAllowed = origLen + 100
+		}
+		if newLen > maxAllowed {
+			return UpdateResult{}, &UpdateError{
+				Code:           "TOO_LONG",
+				Message:        "string length exceeds the correction cap; use delete + entries instead",
+				OriginalLength: origLen,
+				MaxAllowed:     maxAllowed,
+				Provided:       newLen,
+			}
+		}
+	}
+
+	now := time.Now().UTC()
+	updateTS := now.Format(time.RFC3339)
+	rec := updateRec{
+		Op:       "update",
+		ID:       id,
+		UpdateTS: updateTS,
+		Field:    field,
+		Old:      oldValue,
+		New:      value,
+	}
+	line, err := json.Marshal(rec)
+	if err != nil {
+		return UpdateResult{}, fmt.Errorf("marshal update record: %w", err)
+	}
+	line = append(line, '\n')
+
+	f, err := os.OpenFile(s.jsonlPath(ns), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return UpdateResult{}, fmt.Errorf("open jsonl: %w", err)
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close jsonl: %w", cerr)
+		}
+	}()
+	if _, err = f.Write(line); err != nil {
+		return res, fmt.Errorf("write update record: %w", err)
+	}
+	if err = f.Sync(); err != nil {
+		return res, fmt.Errorf("fsync: %w", err)
+	}
+
+	res = UpdateResult{
+		ID:        id,
+		Namespace: ns,
+		UpdateTS:  updateTS,
+		Field:     field,
+		Old:       oldValue,
+		New:       value,
+	}
+	return
 }

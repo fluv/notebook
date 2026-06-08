@@ -109,6 +109,42 @@ type searchResult struct {
 	Hits []SearchHit `json:"hits"`
 }
 
+type updateArgs struct {
+	Namespace        string `json:"namespace"`
+	ID               string `json:"id"`
+	Field            string `json:"field"`
+	Value            any    `json:"value"`
+	IncludeSensitive bool   `json:"include_sensitive,omitempty"`
+}
+
+// updateInputSchema declares the value field as multi-type so clients send the
+// Go value directly rather than JSON-encoding it as a string (same pattern as
+// appendInputSchema).
+var updateInputSchema = &jsonschema.Schema{
+	Type: "object",
+	Properties: map[string]*jsonschema.Schema{
+		"namespace": {Type: "string", Description: "namespace containing the entry"},
+		"id":        {Type: "string", Description: "ULID of the entry to update"},
+		"field": {Type: "string", Description: "top-level key of the content object to update, " +
+			"or '.' to replace the entire content of a plain-string/non-object entry"},
+		"value": {
+			Types:       []string{"object", "array", "string", "number", "boolean", "null"},
+			Description: "replacement value; type must match the existing field type",
+		},
+		"include_sensitive": {Type: "boolean", Description: "required when the entry has exportable:false in its content"},
+	},
+	Required: []string{"namespace", "id", "field", "value"},
+}
+
+type updateResult struct {
+	ID        string `json:"id"`
+	Namespace string `json:"namespace"`
+	UpdateTS  string `json:"update_ts"`
+	Field     string `json:"field"`
+	Old       any    `json:"old"`
+	New       any    `json:"new"`
+}
+
 // boolPtr is a small helper for *bool fields in ToolAnnotations (the SDK
 // mixes pointer and value-typed bools across fields).
 func boolPtr(b bool) *bool { return &b }
@@ -324,6 +360,42 @@ func registerTools(server *mcp.Server, store *Store) {
 			return nil, deleteResult{}, err
 		}
 		return nil, deleteResult{OK: true}, nil
+	})
+
+	mcp.AddTool(server, &mcp.Tool{
+		Name: "update",
+		Description: "Patch a single field of an existing entry. Intended for minor factual corrections " +
+			"(stale dates, small detail changes, short qualifiers) where tombstone + reappend would " +
+			"destroy correct sibling claims in a multi-field entry. " +
+			"Cannot add or remove top-level keys — use delete + append for structural changes. " +
+			"The field type cannot change. String fields are capped at roughly 2× the original length. " +
+			"Use field '.' to replace the entire content of a plain-string or other non-object entry. " +
+			"Entries with exportable:false require include_sensitive:true.",
+		InputSchema: updateInputSchema,
+		Annotations: &mcp.ToolAnnotations{
+			Title:           "Update entry field",
+			DestructiveHint: boolPtr(false),
+			OpenWorldHint:   closedWorld,
+		},
+	}, func(ctx context.Context, req *mcp.CallToolRequest, args updateArgs) (*mcp.CallToolResult, updateResult, error) {
+		start := time.Now()
+		result, err := store.Update(args.Namespace, args.ID, args.Field, args.Value, args.IncludeSensitive)
+		observe("update", start, err,
+			slog.String("namespace", args.Namespace),
+			slog.String("id", args.ID),
+			slog.String("field", args.Field),
+		)
+		if err != nil {
+			return nil, updateResult{}, err
+		}
+		return nil, updateResult{
+			ID:        result.ID,
+			Namespace: result.Namespace,
+			UpdateTS:  result.UpdateTS,
+			Field:     result.Field,
+			Old:       result.Old,
+			New:       result.New,
+		}, nil
 	})
 
 	mcp.AddTool(server, &mcp.Tool{
