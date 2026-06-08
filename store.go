@@ -160,13 +160,17 @@ func writeSensitiveIDs(path string, ids []string) error {
 	if err != nil {
 		return fmt.Errorf("open sensitive: %w", err)
 	}
-	defer f.Close()
 	for _, id := range ids {
 		if _, err := f.WriteString(id + "\n"); err != nil {
+			f.Close()
 			return fmt.Errorf("write sensitive: %w", err)
 		}
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return fmt.Errorf("sync sensitive: %w", err)
+	}
+	return f.Close()
 }
 
 // newID generates a monotonic ULID with millisecond precision. Monotonic
