@@ -91,10 +91,6 @@ func (s *Store) tombstonePath(ns string) string {
 	return filepath.Join(s.dir, ns+".tombstones")
 }
 
-func (s *Store) sensitiveFilePath(ns string) string {
-	return filepath.Join(s.dir, ns+".sensitive")
-}
-
 // truncateTS parses an RFC3339Nano timestamp and returns it at second
 // precision. Milliseconds are irrelevant to callers; removing them saves
 // bytes in every tool response. The on-disk format remains RFC3339Nano.
@@ -104,6 +100,38 @@ func truncateTS(ts string) string {
 		return ts
 	}
 	return t.Format(time.RFC3339)
+}
+
+// isSensitiveEntry reports whether an entry should be treated as sensitive.
+// An entry is sensitive when its content is a JSON object with "exportable"
+// set to the boolean false. Absent field, null, true, and non-object content
+// are all treated as non-sensitive (exportable by default).
+func isSensitiveEntry(content any) bool {
+	m, ok := content.(map[string]any)
+	if !ok {
+		return false
+	}
+	exp, ok := m["exportable"]
+	if !ok {
+		return false
+	}
+	b, ok := exp.(bool)
+	return ok && !b
+}
+
+// isSensitiveRaw is like isSensitiveEntry but operates on the raw JSON of the
+// content field, used in search paths where content hasn't been fully decoded.
+func isSensitiveRaw(contentJSON json.RawMessage) bool {
+	var m map[string]any
+	if err := json.Unmarshal(contentJSON, &m); err != nil {
+		return false
+	}
+	exp, ok := m["exportable"]
+	if !ok {
+		return false
+	}
+	b, ok := exp.(bool)
+	return ok && !b
 }
 
 // tryDeserialiseString checks whether v is a string whose value is a valid
@@ -130,49 +158,6 @@ func tryDeserialiseString(v any) any {
 	return v
 }
 
-// loadSensitive returns the set of IDs marked sensitive for the namespace.
-// Must be called while holding the namespace mutex. Missing file is not an error.
-func (s *Store) loadSensitive(ns string) (map[string]struct{}, error) {
-	set := make(map[string]struct{})
-	f, err := os.Open(s.sensitiveFilePath(ns))
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return set, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line != "" {
-			set[line] = struct{}{}
-		}
-	}
-	return set, scanner.Err()
-}
-
-// writeSensitiveIDs appends entry IDs to the namespace's sensitive file.
-// Must be called while holding the namespace mutex.
-func writeSensitiveIDs(path string, ids []string) error {
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("open sensitive: %w", err)
-	}
-	for _, id := range ids {
-		if _, err := f.WriteString(id + "\n"); err != nil {
-			f.Close()
-			return fmt.Errorf("write sensitive: %w", err)
-		}
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("sync sensitive: %w", err)
-	}
-	return f.Close()
-}
-
 // newID generates a monotonic ULID with millisecond precision. Monotonic
 // ordering is preserved across same-millisecond calls within a process.
 func (s *Store) newID(t time.Time) (string, error) {
@@ -185,13 +170,15 @@ func (s *Store) newID(t time.Time) (string, error) {
 
 // Append serialises a new entry to the namespace's JSONL file. Content
 // may be any JSON value (string, number, object, array, null). The
-// caller passes a native Go value; Append marshals it. If sensitive is
-// true the entry ID is recorded in the namespace's .sensitive file; bare
-// get/search calls will hide it when NOTEBOOK_SENSITIVE_DEFAULT=exclude.
+// caller passes a native Go value; Append marshals it.
+//
+// Sensitivity is declared in the content itself: entries whose content is a
+// JSON object with "exportable": false are treated as sensitive at read time
+// and filtered out by Get/Search when NOTEBOOK_SENSITIVE_DEFAULT=exclude.
 //
 // The returned entry carries a second-precision timestamp (not nano); the
 // on-disk record retains full RFC3339Nano precision.
-func (s *Store) Append(ns string, content any, sensitive bool) (Entry, error) {
+func (s *Store) Append(ns string, content any) (Entry, error) {
 	if err := validateNamespace(ns); err != nil {
 		return Entry{}, err
 	}
@@ -227,11 +214,6 @@ func (s *Store) Append(ns string, content any, sensitive bool) (Entry, error) {
 	if err := f.Sync(); err != nil {
 		return Entry{}, fmt.Errorf("fsync: %w", err)
 	}
-	if sensitive {
-		if err := writeSensitiveIDs(s.sensitiveFilePath(ns), []string{id}); err != nil {
-			return Entry{}, err
-		}
-	}
 	entry.TS = truncateTS(entry.TS) // truncate for response
 	return entry, nil
 }
@@ -241,9 +223,9 @@ func (s *Store) Append(ns string, content any, sensitive bool) (Entry, error) {
 // so they are contiguous on disk and cheaper than N separate Append calls.
 //
 // Contents are marshalled before acquiring the lock so the critical section is
-// as short as possible. If sensitive is true, all entry IDs are recorded in
-// the .sensitive file. Returned entries carry second-precision timestamps.
-func (s *Store) AppendMany(ns string, contents []any, sensitive bool) ([]Entry, error) {
+// as short as possible. Returned entries carry second-precision timestamps.
+// Sensitivity is per-entry in content (see Append).
+func (s *Store) AppendMany(ns string, contents []any) ([]Entry, error) {
 	if err := validateNamespace(ns); err != nil {
 		return nil, err
 	}
@@ -284,15 +266,6 @@ func (s *Store) AppendMany(ns string, contents []any, sensitive bool) ([]Entry, 
 	}
 	if err := f.Sync(); err != nil {
 		return nil, fmt.Errorf("fsync: %w", err)
-	}
-	if sensitive {
-		ids := make([]string, len(entries))
-		for i, e := range entries {
-			ids[i] = e.ID
-		}
-		if err := writeSensitiveIDs(s.sensitiveFilePath(ns), ids); err != nil {
-			return nil, err
-		}
 	}
 	for i := range entries {
 		entries[i].TS = truncateTS(entries[i].TS)
@@ -384,13 +357,6 @@ func (s *Store) Get(ns string, jqFilter string, last int, includeSensitive *bool
 	if includeSensitive != nil {
 		includeSens = *includeSensitive
 	}
-	var sensitiveIDs map[string]struct{}
-	if !includeSens {
-		sensitiveIDs, err = s.loadSensitive(ns)
-		if err != nil {
-			return nil, fmt.Errorf("load sensitive: %w", err)
-		}
-	}
 
 	var query *gojq.Query
 	if jqFilter != "" {
@@ -427,7 +393,7 @@ func (s *Store) Get(ns string, jqFilter string, last int, includeSensitive *bool
 		if _, dead := tombstones[entry.ID]; dead {
 			continue
 		}
-		if _, sens := sensitiveIDs[entry.ID]; sens {
+		if !includeSens && isSensitiveEntry(entry.Content) {
 			continue
 		}
 		if query == nil {
@@ -887,14 +853,6 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 		return nil, fmt.Errorf("load tombstones for %s: %w", ns, err)
 	}
 
-	var sensitiveIDs map[string]struct{}
-	if !includeSens {
-		sensitiveIDs, err = s.loadSensitive(ns)
-		if err != nil {
-			return nil, fmt.Errorf("load sensitive for %s: %w", ns, err)
-		}
-	}
-
 	f, err := os.Open(s.jsonlPath(ns))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -915,8 +873,9 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 			continue
 		}
 		var hdr struct {
-			ID string `json:"id"`
-			TS string `json:"ts"`
+			ID      string          `json:"id"`
+			TS      string          `json:"ts"`
+			Content json.RawMessage `json:"content"`
 		}
 		if err := json.Unmarshal(raw, &hdr); err != nil {
 			return nil, fmt.Errorf("parse line %d in %s: %w", lineNo, ns, err)
@@ -924,7 +883,7 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 		if _, dead := tombstones[hdr.ID]; dead {
 			continue
 		}
-		if _, sens := sensitiveIDs[hdr.ID]; sens {
+		if !includeSens && isSensitiveRaw(hdr.Content) {
 			continue
 		}
 		text := string(raw)

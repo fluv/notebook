@@ -21,7 +21,6 @@ type appendArgs struct {
 	Namespace string `json:"namespace"`
 	Content   any    `json:"content,omitempty"`
 	Entries   []any  `json:"entries,omitempty"`
-	Sensitive bool   `json:"sensitive,omitempty"`
 }
 
 // appendInputSchema overrides the SDK's auto-generated schema. The inferer
@@ -51,10 +50,6 @@ var appendInputSchema = &jsonschema.Schema{
 			Items: &jsonschema.Schema{
 				Types: []string{"object", "array", "string", "number", "boolean", "null"},
 			},
-		},
-		"sensitive": {
-			Type:        "boolean",
-			Description: "when true, mark this entry (or all bulk entries) as sensitive; hidden from get/search when NOTEBOOK_SENSITIVE_DEFAULT=exclude",
 		},
 	},
 	Required: []string{"namespace"},
@@ -211,24 +206,22 @@ func registerTools(server *mcp.Server, store *Store) {
 			return nil, appendResult{}, errors.New("provide either content (single value) or entries (array of values)")
 		}
 		if hasBulk {
-			entries, err := store.AppendMany(args.Namespace, args.Entries, args.Sensitive)
+			entries, err := store.AppendMany(args.Namespace, args.Entries)
 			observe("append", start, err,
 				slog.String("namespace", args.Namespace),
 				slog.String("mode", "bulk"),
 				slog.Int("count", len(args.Entries)),
-				slog.Bool("sensitive", args.Sensitive),
 			)
 			if err != nil {
 				return nil, appendResult{}, err
 			}
 			return nil, appendResult{Entries: entries}, nil
 		}
-		entry, err := store.Append(args.Namespace, args.Content, args.Sensitive)
+		entry, err := store.Append(args.Namespace, args.Content)
 		observe("append", start, err,
 			slog.String("namespace", args.Namespace),
 			slog.String("mode", "single"),
 			slog.Int("count", 1),
-			slog.Bool("sensitive", args.Sensitive),
 		)
 		if err != nil {
 			return nil, appendResult{}, err
