@@ -218,12 +218,13 @@ func (s *Store) scanAllRecords(ns string) (entries []Entry, updatesByID map[stri
 			continue
 		}
 		var peek struct {
-			Op string `json:"op,omitempty"`
+			Op       string `json:"op,omitempty"`
+			UpdateTS string `json:"update_ts,omitempty"`
 		}
 		if err := json.Unmarshal(b, &peek); err != nil {
 			return nil, nil, fmt.Errorf("parse line %d: %w", lineNo, err)
 		}
-		if peek.Op == "update" {
+		if peek.Op == "update" && peek.UpdateTS != "" {
 			var rec updateRec
 			if err := json.Unmarshal(b, &rec); err != nil {
 				return nil, nil, fmt.Errorf("parse update record line %d: %w", lineNo, err)
@@ -829,9 +830,10 @@ lineLoop:
 		}
 		// Skip update records — they are not entries and must not inflate counts.
 		var peek struct {
-			Op string `json:"op,omitempty"`
+			Op       string `json:"op,omitempty"`
+			UpdateTS string `json:"update_ts,omitempty"`
 		}
-		if err := json.Unmarshal(raw, &peek); err == nil && peek.Op == "update" {
+		if err := json.Unmarshal(raw, &peek); err == nil && peek.Op == "update" && peek.UpdateTS != "" {
 			continue
 		}
 		var entry Entry
@@ -975,9 +977,10 @@ func (s *Store) searchOne(ns string, matcher func(string) (int, bool), remaining
 		}
 		// Skip update records — they're not entries and would produce misleading hits.
 		var opPeek struct {
-			Op string `json:"op,omitempty"`
+			Op       string `json:"op,omitempty"`
+			UpdateTS string `json:"update_ts,omitempty"`
 		}
-		if err := json.Unmarshal(raw, &opPeek); err == nil && opPeek.Op == "update" {
+		if err := json.Unmarshal(raw, &opPeek); err == nil && opPeek.Op == "update" && opPeek.UpdateTS != "" {
 			continue
 		}
 		var hdr struct {

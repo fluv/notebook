@@ -1309,3 +1309,62 @@ func TestUpdate_SearchSkipsUpdateRecords(t *testing.T) {
 		t.Errorf("expected 1 hit (original espresso entry), got %d", len(hits))
 	}
 }
+
+// TestUpdate_EntryWithOpKeyNotMisidentified guards against the single-field
+// discriminator bug: an entry whose content object has an "op" key must not be
+// treated as an update record on any read path.
+func TestUpdate_EntryWithOpKeyNotMisidentified(t *testing.T) {
+	s := newTestStore(t)
+	// Append an entry whose content has "op": "delete" — would collide with the
+	// old single-field discriminator that only checked op == "update".
+	e1, err := s.Append("scratch", mustJSON(t, map[string]any{"op": "delete", "target": "alice"}))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	e2, err := s.Append("scratch", mustJSON(t, map[string]any{"note": "normal"}))
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+
+	// Get should return both entries, not silently drop e1.
+	got, err := s.Get("scratch", "", 0, nil)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	ids := make(map[string]bool)
+	for _, raw := range got {
+		if e, ok := raw.(Entry); ok {
+			ids[e.ID] = true
+		}
+	}
+	if !ids[e1.ID] {
+		t.Errorf("entry with op key missing from Get results; got %v", got)
+	}
+	if !ids[e2.ID] {
+		t.Errorf("normal entry missing from Get results")
+	}
+
+	// Describe should count 2 entries, not 1.
+	desc, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if desc.EntryCount != 2 {
+		t.Errorf("describe EntryCount = %d, want 2", desc.EntryCount)
+	}
+
+	// Search should find e1 by its op field value.
+	hits, err := s.Search("delete", "scratch", false, 0, nil)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	found := false
+	for _, h := range hits {
+		if h.ID == e1.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("entry with op key not found via search; hits: %v", hits)
+	}
+}
