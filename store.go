@@ -1115,7 +1115,7 @@ func (s *Store) Search(query, namespace string, useRegex bool, limit int, includ
 // Updates are stored as append records in the same JSONL file. The read path
 // (Get) folds them in chronological order; the last update to a given field
 // wins.
-func (s *Store) Update(ns, id, field string, value any, includeSensitive bool) (UpdateResult, error) {
+func (s *Store) Update(ns, id, field string, value any, includeSensitive bool) (res UpdateResult, err error) {
 	if err := validateNamespace(ns); err != nil {
 		return UpdateResult{}, err
 	}
@@ -1247,20 +1247,25 @@ func (s *Store) Update(ns, id, field string, value any, includeSensitive bool) (
 	if err != nil {
 		return UpdateResult{}, fmt.Errorf("open jsonl: %w", err)
 	}
-	defer f.Close()
-	if _, err := f.Write(line); err != nil {
-		return UpdateResult{}, fmt.Errorf("write update record: %w", err)
+	defer func() {
+		if cerr := f.Close(); cerr != nil && err == nil {
+			err = fmt.Errorf("close jsonl: %w", cerr)
+		}
+	}()
+	if _, err = f.Write(line); err != nil {
+		return res, fmt.Errorf("write update record: %w", err)
 	}
-	if err := f.Sync(); err != nil {
-		return UpdateResult{}, fmt.Errorf("fsync: %w", err)
+	if err = f.Sync(); err != nil {
+		return res, fmt.Errorf("fsync: %w", err)
 	}
 
-	return UpdateResult{
+	res = UpdateResult{
 		ID:        id,
 		Namespace: ns,
 		UpdateTS:  updateTS,
 		Field:     field,
 		Old:       oldValue,
 		New:       value,
-	}, nil
+	}
+	return
 }
