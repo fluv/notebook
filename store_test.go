@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1024,5 +1025,287 @@ func TestGet_JqSeesDeserialised(t *testing.T) {
 	}
 	if len(results) != 1 {
 		t.Fatalf("expected 1 result, got %d (jq may not see deserialised content)", len(results))
+	}
+}
+
+// ---- update tests ----
+
+func mustUpdate(t *testing.T, s *Store, ns, id, field string, value any) UpdateResult {
+	t.Helper()
+	r, err := s.Update(ns, id, field, value, false)
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	return r
+}
+
+func updateCode(t *testing.T, s *Store, ns, id, field string, value any, sensitive bool) string {
+	t.Helper()
+	_, err := s.Update(ns, id, field, value, sensitive)
+	if err == nil {
+		t.Fatal("expected Update error, got nil")
+	}
+	var ue *UpdateError
+	if !errors.As(err, &ue) {
+		t.Fatalf("expected *UpdateError, got %T: %v", err, err)
+	}
+	return ue.Code
+}
+
+func TestUpdate_BasicFieldUpdate(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"date": "2026-06-06", "body": "Pact is roast-dated"}))
+
+	r := mustUpdate(t, s, "scratch", e.ID, "body", "Pact at Waitrose is roast-dated")
+	if r.Old != "Pact is roast-dated" {
+		t.Errorf("old: got %v, want 'Pact is roast-dated'", r.Old)
+	}
+	if r.New != "Pact at Waitrose is roast-dated" {
+		t.Errorf("new: got %v, want 'Pact at Waitrose is roast-dated'", r.New)
+	}
+	if r.Field != "body" {
+		t.Errorf("field: got %q, want 'body'", r.Field)
+	}
+	if r.UpdateTS == "" {
+		t.Error("expected non-empty update_ts")
+	}
+
+	// Get should return updated content.
+	results, _ := s.Get("scratch", "", 0, nil)
+	entry := results[0].(Entry)
+	m, ok := entry.Content.(map[string]any)
+	if !ok {
+		t.Fatalf("expected map content, got %T", entry.Content)
+	}
+	if m["body"] != "Pact at Waitrose is roast-dated" {
+		t.Errorf("get returned stale body: %v", m["body"])
+	}
+	if m["date"] != "2026-06-06" {
+		t.Errorf("sibling field mutated: %v", m["date"])
+	}
+}
+
+func TestUpdate_PlainStringEntry(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, "3 weeks off roast"))
+
+	r := mustUpdate(t, s, "scratch", e.ID, ".", "6 weeks off roast")
+	if r.Old != "3 weeks off roast" {
+		t.Errorf("old: got %v", r.Old)
+	}
+	if r.New != "6 weeks off roast" {
+		t.Errorf("new: got %v", r.New)
+	}
+
+	results, _ := s.Get("scratch", "", 0, nil)
+	entry := results[0].(Entry)
+	if entry.Content != "6 weeks off roast" {
+		t.Errorf("expected updated string, got %v", entry.Content)
+	}
+}
+
+func TestUpdate_MultipleUpdates_LastWins(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"note": "v1"}))
+
+	mustUpdate(t, s, "scratch", e.ID, "note", "v2")
+	mustUpdate(t, s, "scratch", e.ID, "note", "v3")
+
+	results, _ := s.Get("scratch", "", 0, nil)
+	entry := results[0].(Entry)
+	if m, ok := entry.Content.(map[string]any); ok {
+		if m["note"] != "v3" {
+			t.Errorf("expected last update to win: got %v", m["note"])
+		}
+	} else {
+		t.Fatalf("expected map, got %T", entry.Content)
+	}
+}
+
+func TestUpdate_EntryNotFound(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, "x"))
+	// Valid ULID format (26 Crockford base32 chars) that is not in the namespace.
+	fakeID := "00000000000000000000000000"
+	if code := updateCode(t, s, "scratch", fakeID, ".", "y", false); code != "ENTRY_NOT_FOUND" {
+		t.Errorf("expected ENTRY_NOT_FOUND, got %s", code)
+	}
+}
+
+func TestUpdate_TombstonedEntry(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"x": "y"}))
+	_ = s.Delete("scratch", e.ID)
+
+	if code := updateCode(t, s, "scratch", e.ID, "x", "z", false); code != "ENTRY_TOMBSTONED" {
+		t.Errorf("expected ENTRY_TOMBSTONED, got %s", code)
+	}
+}
+
+func TestUpdate_ImmutableField_ID(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"x": "y"}))
+	if code := updateCode(t, s, "scratch", e.ID, "id", "newid", false); code != "IMMUTABLE_FIELD" {
+		t.Errorf("expected IMMUTABLE_FIELD, got %s", code)
+	}
+}
+
+func TestUpdate_ImmutableField_TS(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"x": "y"}))
+	if code := updateCode(t, s, "scratch", e.ID, "ts", "2020-01-01T00:00:00Z", false); code != "IMMUTABLE_FIELD" {
+		t.Errorf("expected IMMUTABLE_FIELD, got %s", code)
+	}
+}
+
+func TestUpdate_KeyDrift_AddKey(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"body": "original"}))
+	if code := updateCode(t, s, "scratch", e.ID, "note", "extra", false); code != "KEY_DRIFT" {
+		t.Errorf("expected KEY_DRIFT on new key, got %s", code)
+	}
+}
+
+func TestUpdate_KeyDrift_NonObjectContent(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, "plain string"))
+	if code := updateCode(t, s, "scratch", e.ID, "body", "replacement", false); code != "KEY_DRIFT" {
+		t.Errorf("expected KEY_DRIFT when targeting named field on non-object, got %s", code)
+	}
+}
+
+func TestUpdate_TypeMismatch(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"count": 5.0}))
+	if code := updateCode(t, s, "scratch", e.ID, "count", "five", false); code != "TYPE_MISMATCH" {
+		t.Errorf("expected TYPE_MISMATCH, got %s", code)
+	}
+}
+
+func TestUpdate_TooLong(t *testing.T) {
+	s := newTestStore(t)
+	original := strings.Repeat("a", 50)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"body": original}))
+	// max = max(100, 150) = 150; 200 chars exceeds that
+	tooLong := strings.Repeat("b", 200)
+	_, err := s.Update("scratch", e.ID, "body", tooLong, false)
+	if err == nil {
+		t.Fatal("expected TOO_LONG error")
+	}
+	var ue *UpdateError
+	if !errors.As(err, &ue) || ue.Code != "TOO_LONG" {
+		t.Fatalf("expected TOO_LONG UpdateError, got %v", err)
+	}
+	if ue.OriginalLength != 50 {
+		t.Errorf("original_length: got %d, want 50", ue.OriginalLength)
+	}
+	if ue.MaxAllowed != 150 {
+		t.Errorf("max_allowed: got %d, want 150", ue.MaxAllowed)
+	}
+	if ue.Provided != 200 {
+		t.Errorf("provided: got %d, want 200", ue.Provided)
+	}
+}
+
+func TestUpdate_TooLong_ShortStringsUse100Floor(t *testing.T) {
+	s := newTestStore(t)
+	// original = 10 chars; max = max(20, 110) = 110; 111 chars should fail
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"body": "ten chars!"}))
+	tooLong := strings.Repeat("x", 111)
+	if code := updateCode(t, s, "scratch", e.ID, "body", tooLong, false); code != "TOO_LONG" {
+		t.Errorf("expected TOO_LONG, got %s", code)
+	}
+	// 110 chars should pass
+	exactlyMax := strings.Repeat("x", 110)
+	mustUpdate(t, s, "scratch", e.ID, "body", exactlyMax)
+}
+
+func TestUpdate_SensitiveRequiresOptIn(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", sensitiveContent("original"))
+	if code := updateCode(t, s, "scratch", e.ID, "msg", "corrected", false); code != "SENSITIVE_REQUIRES_OPT_IN" {
+		t.Errorf("expected SENSITIVE_REQUIRES_OPT_IN, got %s", code)
+	}
+}
+
+func TestUpdate_SensitiveWithOptIn(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", sensitiveContent("original"))
+	r, err := s.Update("scratch", e.ID, "msg", "corrected", true)
+	if err != nil {
+		t.Fatalf("Update with include_sensitive=true: %v", err)
+	}
+	if r.Old != "original" {
+		t.Errorf("old: got %v", r.Old)
+	}
+}
+
+func TestUpdate_PersistsAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	s1, _ := NewStore(dir)
+	e, _ := s1.Append("scratch", mustJSON(t, map[string]any{"body": "before"}))
+	_, _ = s1.Update("scratch", e.ID, "body", "after", false)
+
+	s2, _ := NewStore(dir)
+	results, _ := s2.Get("scratch", "", 0, nil)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(results))
+	}
+	entry := results[0].(Entry)
+	if m, ok := entry.Content.(map[string]any); ok {
+		if m["body"] != "after" {
+			t.Errorf("update not persisted: got %v", m["body"])
+		}
+	} else {
+		t.Fatalf("expected map, got %T", entry.Content)
+	}
+}
+
+func TestUpdate_TombstonedAfterUpdateHidesEntry(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"body": "original"}))
+	mustUpdate(t, s, "scratch", e.ID, "body", "corrected")
+	_ = s.Delete("scratch", e.ID)
+
+	results, _ := s.Get("scratch", "", 0, nil)
+	if len(results) != 0 {
+		t.Errorf("tombstoned entry should be hidden even after update; got %d results", len(results))
+	}
+}
+
+func TestUpdate_DoesNotInflateDescribeCount(t *testing.T) {
+	s := newTestStore(t)
+	e, _ := s.Append("scratch", mustJSON(t, map[string]any{"body": "original"}))
+	mustUpdate(t, s, "scratch", e.ID, "body", "corrected")
+
+	d, err := s.Describe("scratch", "")
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	if d.EntryCount != 1 {
+		t.Errorf("describe should count 1 entry, got %d (update records should not inflate count)", d.EntryCount)
+	}
+}
+
+func TestUpdate_SearchSkipsUpdateRecords(t *testing.T) {
+	s := newTestStore(t)
+	_, _ = s.Append("scratch", mustJSON(t, map[string]any{"note": "espresso"}))
+	e2, _ := s.Append("scratch", mustJSON(t, map[string]any{"note": "filter"}))
+	mustUpdate(t, s, "scratch", e2.ID, "note", "espresso update")
+
+	// search operates on raw JSONL; update records are skipped as hits
+	hits, err := s.Search("espresso", "scratch", false, 0, nil)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	for _, h := range hits {
+		if h.ID == e2.ID {
+			// the update record for e2 should not appear as a hit
+			// (the original entry for e2 says "filter" and won't match)
+			t.Errorf("unexpected hit for e2 (the update record should be skipped): %+v", h)
+		}
+	}
+	if len(hits) != 1 {
+		t.Errorf("expected 1 hit (original espresso entry), got %d", len(hits))
 	}
 }
