@@ -136,6 +136,25 @@ var updateInputSchema = &jsonschema.Schema{
 	Required: []string{"namespace", "id", "field", "value"},
 }
 
+// updateOutputSchema overrides the SDK-inferred output schema for the update
+// tool. The Old and New fields are typed `any` in updateResult, which the SDK
+// reflects as the boolean schema `true` (JSON Schema "accept anything"). Some
+// clients — including Claude Code — reject boolean property schemas. An
+// explicit multi-type array is the canonical equivalent and is universally
+// accepted.
+var updateOutputSchema = &jsonschema.Schema{
+	Type: "object",
+	Properties: map[string]*jsonschema.Schema{
+		"id":        {Type: "string"},
+		"namespace": {Type: "string"},
+		"update_ts": {Type: "string"},
+		"field":     {Type: "string"},
+		"old":       {Types: []string{"object", "array", "string", "number", "boolean", "null"}},
+		"new":       {Types: []string{"object", "array", "string", "number", "boolean", "null"}},
+	},
+	Required: []string{"id", "namespace", "update_ts", "field", "old", "new"},
+}
+
 type updateResult struct {
 	ID        string `json:"id"`
 	Namespace string `json:"namespace"`
@@ -371,7 +390,8 @@ func registerTools(server *mcp.Server, store *Store) {
 			"The field type cannot change. String fields are capped at roughly 2× the original length. " +
 			"Use field '.' to replace the entire content of a plain-string or other non-object entry. " +
 			"Entries with exportable:false require include_sensitive:true.",
-		InputSchema: updateInputSchema,
+		InputSchema:  updateInputSchema,
+		OutputSchema: updateOutputSchema,
 		Annotations: &mcp.ToolAnnotations{
 			Title:           "Update entry field",
 			DestructiveHint: boolPtr(false),
